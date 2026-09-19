@@ -275,14 +275,13 @@ class TestWeeklyActivity:
         assert result == 550.0
 
     def test_weekly_activity_with_workouts(self):
-        """Тест включення тренувань."""
+        """Тренування не додаються до експортованих активних калорій."""
         rows = [
             {"active_calories": 500, "workout_calories": 100},
             {"active_calories": 600, "workout_calories": 50},
         ]
         result = weekly_activity(rows, include_workouts=True)
-        # (500+100 + 600+50) / 2 = 1250 / 2 = 625
-        assert result == 625.0
+        assert result == 550.0
 
     def test_weekly_activity_by_day_type(self):
         rows = [
@@ -293,9 +292,14 @@ class TestWeeklyActivity:
         ]
 
         assert weekly_activity_by_day_type(rows) == {
-            "training": 650.0,
+            "training": 450.0,
             "rest": 650.0,
         }
+
+    def test_workout_calories_only_classify_day_type(self):
+        rows = [{"active_calories": 500, "workout_calories": 300}]
+
+        assert weekly_activity_by_day_type(rows)["training"] == 500.0
 
     def test_zero_workout_calories_is_rest_day(self):
         rows = [{"active_calories": 500, "workout_calories": 0}]

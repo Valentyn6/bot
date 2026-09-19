@@ -160,7 +160,7 @@ async def current_day_is_training(profile) -> bool:
 
 
 def total_activity(row) -> float:
-    return row["active_calories"] + row["workout_calories"]
+    return row["active_calories"]
 
 
 async def home_text(user_id: int) -> str:
@@ -391,9 +391,17 @@ async def admin_user(callback: CallbackQuery) -> None:
     if not account:
         await callback.answer("Користувача не знайдено.", show_alert=True)
         return
+    profiles = await db.profiles(user_id)
+    if not profiles:
+        await db.create_profile(user_id)
+        profiles = await db.profiles(user_id)
+    profile = next((item for item in profiles if item["id"] == account["active_profile_id"]), profiles[0])
     status = {"approved": "схвалений", "pending": "очікує", "rejected": "відхилений", "banned": "заблокований"}.get(account["access_status"], account["access_status"])
-    text = f"👤 <b>Користувач {user_id}</b>\n\nСтатус: {status}\nСамостійний раціон: {'дозволено' if account['can_manage_diet'] else 'заборонено'}"
+    text = f"👤 <b>Користувач {user_id}</b>\n\nСтатус: {status}\nПрофіль: {profile['name']}\nРежим: <b>{profile['goal_mode']}</b>\nСамостійний раціон: {'дозволено' if account['can_manage_diet'] else 'заборонено'}"
     actions = []
+    if account["access_status"] == "approved":
+        actions.append([("🎯 Набір", f"adm:mode:{user_id}:набір"), ("⚖️ Підтримання", f"adm:mode:{user_id}:підтримання")])
+        actions.append([("🔥 Схуднення", f"adm:mode:{user_id}:схуднення")])
     if account["access_status"] in {"pending", "rejected"}:
         actions.append([("✅ Схвалити", f"adm:approve:{user_id}")])
     if account["access_status"] == "approved":
@@ -415,12 +423,25 @@ async def admin_action(callback: CallbackQuery) -> None:
         return
     if callback.data == "adm:own":
         await db.set_managed_profile(callback.from_user.id, None)
-        await callback.message.edit_text(await home_text(callback.from_user.id), reply_markup=await home_markup(callback.from_user.id), parse_mode="HTML")
-        await callback.answer("Ваш профіль відкрито")
+        await profile_callback(callback)
         return
     if callback.data == "adm:foods_import":
         await callback.message.answer("📥 Надішліть цей файл документом: FoodDatabase.md\n\nПеревіряються заголовок # FoodDatabase, структура таблиці, всі 7 колонок, одиниці г/мл/шт і числові значення. Випадкові файли будуть відхилені.")
         await callback.answer()
+        return
+    if callback.data.startswith("adm:mode:"):
+        _, _, raw_user_id, mode = callback.data.split(":")
+        user_id = int(raw_user_id)
+        profiles = await db.profiles(user_id)
+        if not profiles:
+            await db.create_profile(user_id)
+            profiles = await db.profiles(user_id)
+        account = await db.account(user_id)
+        profile = next((item for item in profiles if item["id"] == account["active_profile_id"]), profiles[0])
+        source = {"набір": "surplus_gain", "підтримання": "surplus_maintenance", "схуднення": "deficit_loss"}[mode]
+        await db.update_profile(profile["id"], goal_mode=mode, surplus_deficit=profile[source])
+        await callback.message.edit_text("🛡 Режим профілю оновлено.", reply_markup=buttons([[('← До користувача', f'adm:user:{user_id}')], [('← До адмін-панелі', 'admin')]]))
+        await callback.answer("Режим оновлено")
         return
     _, action, raw_user_id = callback.data.split(":")
     user_id = int(raw_user_id)

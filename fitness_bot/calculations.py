@@ -78,10 +78,7 @@ def food_totals(rows: list[Any]) -> dict[str, float]:
 
 
 def weekly_activity(rows: list[Any], include_workouts: bool = False) -> float:
-    total = sum(row["active_calories"] for row in rows)
-    if include_workouts:
-        total += sum(row["workout_calories"] for row in rows)
-    return total / len(rows) if rows else 0
+    return sum(row["active_calories"] for row in rows) / len(rows) if rows else 0
 
 
 def is_training_day(row: Any) -> bool:
@@ -92,7 +89,7 @@ def weekly_activity_by_day_type(rows: list[Any]) -> dict[str, float]:
     training_days = [row for row in rows if is_training_day(row)]
     rest_days = [row for row in rows if not is_training_day(row)]
     return {
-        "training": weekly_activity(training_days, include_workouts=True),
+        "training": weekly_activity(training_days),
         "rest": weekly_activity(rest_days),
     }
 

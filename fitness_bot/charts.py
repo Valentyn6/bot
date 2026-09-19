@@ -31,7 +31,7 @@ def weight_chart(rows: list[Any]) -> Path:
 
 def activity_chart(rows: list[Any], field: str, title: str, ylabel: str) -> Path:
     if field == "total_calories":
-        values = [row["active_calories"] + row["workout_calories"] for row in rows]
+        values = [row["active_calories"] for row in rows]
     else:
         values = [row[field] for row in rows]
     return _chart(title, [row["log_date"] for row in rows], values, ylabel)

@@ -5,3 +5,5 @@ __pycache__/
 *.sqlite3
 .pytest_cache/
 .vs/
+fitness_bot.log
+fitness_bot.log

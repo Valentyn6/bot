@@ -73,7 +73,7 @@ async def source_values(
     weights = await db.weights(profile["id"])
     activities = await db.activities(profile["id"], 7)
     weight = weights[-1]["weight"] if weights else DEFAULT_PROFILE_WEIGHT
-    activity = weekly_activity(activities, include_workouts=True)
+    activity = weekly_activity(activities)
 
     warning = ""
     if not weights and not activities:
@@ -87,8 +87,8 @@ async def source_values(
 
 
 def total_activity(row: dict[str, Any]) -> float:
-    """Розрахувати загальну активність (звичайна + тренування)."""
-    return row.get("active_calories", 0) + row.get("workout_calories", 0)
+    """Повернути експортовані активні калорії."""
+    return row.get("active_calories", 0)
 
 
 def remaining_value(target: float, consumed: float) -> str:
