@@ -1,0 +1,1 @@
+"""Telegram fitness tracker bot."""

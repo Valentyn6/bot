@@ -1,0 +1,4 @@
+aiogram>=3.13,<4
+aiosqlite>=0.20,<1
+matplotlib>=3.8,<4
+python-dotenv>=1.0,<2
