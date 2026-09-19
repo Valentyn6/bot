@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS profiles (
     surplus_gain REAL NOT NULL DEFAULT 300,
     surplus_maintenance REAL NOT NULL DEFAULT 0,
     deficit_loss REAL NOT NULL DEFAULT 400,
+    diet_mode TEXT NOT NULL DEFAULT 'single',
     protein_per_kg REAL NOT NULL DEFAULT 2,
     fat_per_kg REAL NOT NULL DEFAULT 1,
     manual_mode INTEGER NOT NULL DEFAULT 0,
@@ -123,6 +124,7 @@ class Database:
         await self._migrate_accounts()
         await self._migrate_activity_log()
         await self._migrate_food_log()
+        await self._migrate_profiles()
         await self.conn.commit()
 
     async def _migrate_accounts(self) -> None:
@@ -146,6 +148,11 @@ class Database:
         columns = {row[1] for row in await (await self._db().execute("PRAGMA table_info(food_log)")).fetchall()}
         if "diet_type" not in columns:
             await self._db().execute("ALTER TABLE food_log ADD COLUMN diet_type TEXT NOT NULL DEFAULT 'rest'")
+
+    async def _migrate_profiles(self) -> None:
+        columns = {row[1] for row in await (await self._db().execute("PRAGMA table_info(profiles)")).fetchall()}
+        if "diet_mode" not in columns:
+            await self._db().execute("ALTER TABLE profiles ADD COLUMN diet_mode TEXT NOT NULL DEFAULT 'single'")
 
     async def configure_admin(self, telegram_id: int | None) -> int:
         db = self._db()
@@ -248,7 +255,7 @@ class Database:
         return await (await self._db().execute("SELECT * FROM profiles WHERE owner_telegram_id=? ORDER BY id", (owner_id,))).fetchall()
 
     async def update_profile(self, profile_id: int, **values: Any) -> None:
-        allowed = {"name", "height", "age", "sex", "target_weight", "goal_mode", "surplus_deficit", "surplus_gain", "surplus_maintenance", "deficit_loss", "protein_per_kg", "fat_per_kg", "manual_mode", "manual_weight", "manual_activity", "workout_kcal_today"}
+        allowed = {"name", "height", "age", "sex", "target_weight", "goal_mode", "surplus_deficit", "surplus_gain", "surplus_maintenance", "deficit_loss", "diet_mode", "protein_per_kg", "fat_per_kg", "manual_mode", "manual_weight", "manual_activity", "workout_kcal_today"}
         values = {key: value for key, value in values.items() if key in allowed}
         if not values:
             return
@@ -329,8 +336,8 @@ class Database:
             raise ValueError("Продукт більше не існує в базі. Оновіть пораду.")
         try:
             await db.execute(
-                "INSERT INTO food_log(profile_id, log_date, meal, product_id, quantity, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (profile_id, log_date, meal, product_id, quantity, datetime.now().isoformat(timespec="seconds")),
+                "INSERT INTO food_log(profile_id, log_date, diet_type, meal, product_id, quantity, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (profile_id, log_date, diet_type, meal, product_id, quantity, datetime.now().isoformat(timespec="seconds")),
             )
             await db.commit()
         except aiosqlite.IntegrityError as exc:

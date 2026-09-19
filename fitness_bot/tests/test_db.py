@@ -9,6 +9,11 @@ def test_food_logs_are_isolated_by_diet_type(tmp_path):
         await database.connect()
         await database.ensure_account(1)
         profile_id = await database.create_profile(1)
+        profile = await database.active_profile(1)
+        assert profile["diet_mode"] == "single"
+        await database.update_profile(profile_id, diet_mode="split")
+        profile = await database.active_profile(1)
+        assert profile["diet_mode"] == "split"
         product_id = await database.add_food(
             1,
             {

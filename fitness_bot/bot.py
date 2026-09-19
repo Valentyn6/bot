@@ -136,6 +136,16 @@ async def source_values(profile, diet_type: str | None = None):
     weights = await db.weights(profile["id"])
     activities = await db.activities(profile["id"], 7)
     weight = weights[-1]["weight"] if weights else 71
+    if profile["diet_mode"] == "single":
+        activity = weekly_activity(activities)
+        warning = ""
+        if not weights and not activities:
+            warning = "⚠️ Немає ні ваги, ні активності — використано дефолти: 71 кг, 0 ккал."
+        elif not weights:
+            warning = f"⚠️ Немає даних ваги — використано дефолт 71 кг. Активність: {round(activity)} ккал."
+        elif not activities:
+            warning = f"⚠️ Немає даних активності — використано 0 ккал. Вага: {weight} кг."
+        return weight, activity, warning
     today = date.today().isoformat()
     today_activity = next((row for row in activities if row["log_date"] == today), None)
     training = is_training_day(today_activity) if today_activity else False
@@ -230,13 +240,17 @@ def diet_title(diet_type: str) -> str:
 
 async def food_screen(user_id: int, diet_type: str = DIET_REST) -> tuple[str, InlineKeyboardMarkup]:
     profile = await account_profile(user_id)
+    split_mode = profile["diet_mode"] == "split"
+    diet_type = diet_type if split_mode else DIET_REST
     weight, activity, _ = await source_values(profile, diet_type)
     targets = calculate_targets(profile, weight, activity)
     day_type = "тренувальний" if await current_day_is_training(profile) else "звичайний"
     rows = await db.food_day(profile["id"], date.today().isoformat(), diet_type)
     totals = food_totals(rows)
+    title = diet_title(diet_type) if split_mode else "🍽 Раціон"
+    date_line = f"Раціон за {date.today().isoformat()} · {day_type} день" if split_mode else f"Раціон за {date.today().isoformat()}"
     text = (
-        f"{diet_title(diet_type)}\nРаціон за {date.today().isoformat()} · {day_type} день\n\n"
+        f"{title}\n{date_line}\n\n"
         f"🎯 Цільові показники\n\n"
         f"{progress_line('Калорії', targets['total'], totals['calories'], 'ккал')}\n\n"
         f"{progress_line('Білки', targets['protein'], totals['protein'], 'г')}\n\n"
@@ -376,7 +390,8 @@ async def admin_callback(callback: CallbackQuery) -> None:
     accounts = await db.accounts()
     markup = admin_markup(accounts)
     markup.inline_keyboard.insert(0, [InlineKeyboardButton(text="👤 Мій профіль", callback_data="adm:own")])
-    markup.inline_keyboard.insert(1, [InlineKeyboardButton(text="📥 Імпорт FoodDatabase.md", callback_data="adm:foods_import")])
+    markup.inline_keyboard.insert(1, [InlineKeyboardButton(text="🍽 Мій режим раціону", callback_data=f"adm:dietmode:{callback.from_user.id}")])
+    markup.inline_keyboard.insert(2, [InlineKeyboardButton(text="📥 Імпорт FoodDatabase.md", callback_data="adm:foods_import")])
     await callback.message.edit_text("🛡 <b>Адмін-панель</b>\n\nКористувачі, доступи та спільна база продуктів. Оберіть користувача для дії:", reply_markup=markup, parse_mode="HTML")
     await callback.answer()
 
@@ -397,11 +412,13 @@ async def admin_user(callback: CallbackQuery) -> None:
         profiles = await db.profiles(user_id)
     profile = next((item for item in profiles if item["id"] == account["active_profile_id"]), profiles[0])
     status = {"approved": "схвалений", "pending": "очікує", "rejected": "відхилений", "banned": "заблокований"}.get(account["access_status"], account["access_status"])
-    text = f"👤 <b>Користувач {user_id}</b>\n\nСтатус: {status}\nПрофіль: {profile['name']}\nРежим: <b>{profile['goal_mode']}</b>\nСамостійний раціон: {'дозволено' if account['can_manage_diet'] else 'заборонено'}"
+    diet_mode = "окремі раціони: тренувальний + звичайний" if profile["diet_mode"] == "split" else "один раціон"
+    text = f"👤 <b>Користувач {user_id}</b>\n\nСтатус: {status}\nПрофіль: {profile['name']}\nРежим: <b>{profile['goal_mode']}</b>\nТип раціонів: <b>{diet_mode}</b>\nСамостійний раціон: {'дозволено' if account['can_manage_diet'] else 'заборонено'}"
     actions = []
     if account["access_status"] == "approved":
         actions.append([("🎯 Набір", f"adm:mode:{user_id}:набір"), ("⚖️ Підтримання", f"adm:mode:{user_id}:підтримання")])
         actions.append([("🔥 Схуднення", f"adm:mode:{user_id}:схуднення")])
+        actions.append([("🍽 Один раціон", f"adm:dietmode:{user_id}:single"), ("🏋️ Два раціони", f"adm:dietmode:{user_id}:split")])
     if account["access_status"] in {"pending", "rejected"}:
         actions.append([("✅ Схвалити", f"adm:approve:{user_id}")])
     if account["access_status"] == "approved":
@@ -420,6 +437,30 @@ async def admin_user(callback: CallbackQuery) -> None:
 async def admin_action(callback: CallbackQuery) -> None:
     if not await is_admin(callback.from_user.id):
         await callback.answer("Недостатньо прав.", show_alert=True)
+        return
+    if callback.data.startswith("adm:dietmode:"):
+        parts = callback.data.split(":")
+        user_id = int(parts[2])
+        mode = parts[3] if len(parts) > 3 else None
+        if mode not in {"single", "split"}:
+            await callback.message.edit_text("🍽 Оберіть режим раціонів:", reply_markup=buttons([
+                [("🍽 Один раціон", f"adm:dietmode:{user_id}:single"), ("🏋️ Два раціони", f"adm:dietmode:{user_id}:split")],
+                [("← До адмін-панелі", "admin")],
+            ]))
+            await callback.answer()
+            return
+        account = await db.account(user_id)
+        profiles = await db.profiles(user_id)
+        if not profiles:
+            await db.create_profile(user_id)
+            profiles = await db.profiles(user_id)
+        profile = next((item for item in profiles if item["id"] == account["active_profile_id"]), profiles[0])
+        await db.update_profile(profile["id"], diet_mode=mode)
+        await callback.message.edit_text("🛡 Режим раціонів оновлено.", reply_markup=buttons([
+            [("← До користувача", f"adm:user:{user_id}")],
+            [("← До адмін-панелі", "admin")],
+        ]))
+        await callback.answer("Режим раціонів оновлено")
         return
     if callback.data == "adm:own":
         await db.set_managed_profile(callback.from_user.id, None)
@@ -566,6 +607,12 @@ async def profile_value(message: Message, state: FSMContext) -> None:
 async def food_callback(callback: CallbackQuery) -> None:
     if await access_denied(callback):
         return
+    profile = await account_profile(callback.from_user.id)
+    if profile["diet_mode"] == "single":
+        text, markup = await food_screen(callback.from_user.id, DIET_REST)
+        await callback.message.edit_text(text, reply_markup=markup)
+        await callback.answer()
+        return
     await callback.message.edit_text(
         "🍽 <b>Оберіть раціон</b>",
         reply_markup=buttons([
@@ -586,6 +633,9 @@ async def selected_food_callback(callback: CallbackQuery) -> None:
     if diet_type not in {DIET_TRAINING, DIET_REST}:
         await callback.answer("Невідомий тип раціону", show_alert=True)
         return
+    profile = await account_profile(callback.from_user.id)
+    if profile["diet_mode"] == "single":
+        diet_type = DIET_REST
     text, markup = await food_screen(callback.from_user.id, diet_type)
     await callback.message.edit_text(text, reply_markup=markup)
     await callback.answer()
