@@ -986,7 +986,7 @@ async def admin_user(callback: CallbackQuery) -> None:
     display_name = " ".join(part for part in (account["first_name"], account["last_name"]) if part) or "не вказане"
     text = (
         f"👤 <b>Користувач</b>\n"
-        f"ID: <code>{user_id}</code>\n"
+        f'ID: <a href="tg://user?id={user_id}">{user_id}</a>\n'
         f"Нік: {escape(username)}\n"
         f"Ім’я: {escape(display_name)}\n\n"
         f"Статус: {escape(status)}\n"
