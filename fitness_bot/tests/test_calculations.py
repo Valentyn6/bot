@@ -1,5 +1,7 @@
 """Unit тести для calculations.py"""
 
+import sqlite3
+
 import pytest
 from fitness_bot.calculations import (
     calculate_targets,
@@ -175,6 +177,29 @@ class TestCalculateTargets:
         """Тест невалідної ваги."""
         with pytest.raises(ValidationError):
             calculate_targets(valid_profile, 500, 300)
+
+    def test_calculate_targets_rejects_unknown_sex(self, valid_profile):
+        valid_profile["sex"] = "інше"
+        with pytest.raises(ValidationError):
+            calculate_targets(valid_profile, 75, 300)
+
+    def test_calculate_targets_accepts_sqlite_row(self, valid_profile):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.execute(
+            "CREATE TABLE profile (sex TEXT, height REAL, age INTEGER, goal_mode TEXT, "
+            "surplus_deficit REAL, protein_per_kg REAL, fat_per_kg REAL)"
+        )
+        connection.execute(
+            "INSERT INTO profile VALUES (?, ?, ?, ?, ?, ?, ?)",
+            tuple(valid_profile[key] for key in ("sex", "height", "age", "goal_mode", "surplus_deficit", "protein_per_kg", "fat_per_kg")),
+        )
+        profile_row = connection.execute("SELECT * FROM profile").fetchone()
+
+        result = calculate_targets(profile_row, 75, 300)
+
+        assert result["total"] > 0
+        connection.close()
 
 
 class TestFoodTotals:

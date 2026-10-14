@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
+import math
 from typing import Any
 
 from .constants import (
     MAX_AGE,
     MAX_HEIGHT_CM,
     MAX_WEIGHT_KG,
+    MAX_ACTIVITY_KCAL,
     MIN_AGE,
     MIN_HEIGHT_CM,
     MIN_WEIGHT_KG,
 )
+from .time_utils import local_today
 
 
 class ValidationError(ValueError):
@@ -52,17 +55,36 @@ def calculate_targets(profile: Any, weight: float, activity: float) -> dict[str,
     weight = validate_weight(weight)
     height = validate_height(profile["height"])
     age = validate_age(profile["age"])
-    try:
-        activity = max(0.0, float(activity))
-    except (TypeError, ValueError) as exc:
-        raise ValidationError("Активність має бути числом") from exc
-    sex_const = -161 if profile["sex"] == "жіноча" else 5
-    bmr = round(10 * weight + 6.25 * height - 5 * age + sex_const)
+    activity = _validate_range(activity, "Активність", 0, MAX_ACTIVITY_KCAL)
     mode = profile["goal_mode"]
-    signed = 0 if mode == "підтримання" else (profile["surplus_deficit"] if mode == "набір" else -profile["surplus_deficit"])
+    if mode not in {"підтримання", "набір", "схуднення"}:
+        raise ValidationError("Невідомий режим цілі")
+    try:
+        adjustment = float(profile["surplus_deficit"])
+        protein_per_kg = float(profile["protein_per_kg"])
+        fat_per_kg = float(profile["fat_per_kg"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValidationError("Параметри цілі та макронутрієнтів мають бути числовими") from exc
+    if not math.isfinite(adjustment) or not 0 <= adjustment <= 10_000:
+        raise ValidationError("Корекція калорій має бути від 0 до 10 000 ккал")
+    if not math.isfinite(protein_per_kg) or not 0 <= protein_per_kg <= 10:
+        raise ValidationError("Білок має бути від 0 до 10 г/кг")
+    if not math.isfinite(fat_per_kg) or not 0 <= fat_per_kg <= 10:
+        raise ValidationError("Жири мають бути від 0 до 10 г/кг")
+    try:
+        sex = profile["sex"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ValidationError("Оберіть стать у профілі") from exc
+    if sex not in {"чоловіча", "жіноча"}:
+        raise ValidationError("Оберіть стать у профілі")
+    sex_const = -161 if sex == "жіноча" else 5
+    bmr = round(10 * weight + 6.25 * height - 5 * age + sex_const)
+    signed = 0 if mode == "підтримання" else (adjustment if mode == "набір" else -adjustment)
     total = round(bmr + activity + signed)
-    protein = round(weight * float(profile["protein_per_kg"]))
-    fat = round(weight * float(profile["fat_per_kg"]))
+    if total <= 0:
+        raise ValidationError("Цільові налаштування дають нульову або від’ємну калорійність")
+    protein = round(weight * protein_per_kg)
+    fat = round(weight * fat_per_kg)
     carbs = max(0, round((total - protein * 4 - fat * 9) / 4))
     bmi = round(weight / (height / 100) ** 2, 1)
     return {"bmr": bmr, "total": total, "protein": protein, "fat": fat, "carbs": carbs, "bmi": bmi, "weight": weight, "activity": round(activity)}
@@ -103,12 +125,13 @@ def weight_stats(rows: list[Any], target: float | None) -> dict[str, Any]:
     pace = change / elapsed * 7
     eta = "н/д"
     if abs(pace) >= 0.01 and target is not None:
+        reached = (pace > 0 and current["weight"] >= target) or (pace < 0 and current["weight"] <= target)
         weeks = (target - current["weight"]) / pace
-        eta = "ціль вже досягнута" if weeks < 0 else f"{weeks:.1f} тиж."
+        eta = "ціль уже досягнута" if reached else (f"{weeks:.1f} тиж." if weeks >= 0 else "темп віддаляє від цілі")
     return {"count": len(rows), "first": first["weight"], "current": current["weight"], "change": change, "pace": pace, "eta": eta, "last_date": current["log_date"]}
 
 
 def normalize_date(value: str | None) -> str:
     if not value:
-        return date.today().isoformat()
+        return local_today().isoformat()
     return date.fromisoformat(value.strip()).isoformat()

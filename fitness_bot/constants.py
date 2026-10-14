@@ -42,7 +42,7 @@ DEFAULT_SURPLUS_MAINTENANCE = 0
 DEFAULT_DEFICIT_LOSS = 400  # відняти ккал при схуднені
 
 # ============ BMR (Basal Metabolic Rate) константи ============
-# Формула Харріс-Бенедикта
+# Формула Mifflin–St Jeor
 BMR_MALE_CONSTANT = 5  # чоловіча стала
 BMR_FEMALE_CONSTANT = -161  # жіноча стала
 
