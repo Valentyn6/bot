@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import date, timedelta
 import math
 from typing import Any
@@ -105,6 +106,21 @@ def weekly_activity(rows: list[Any], include_workouts: bool = False) -> float:
 
 def is_training_day(row: Any) -> bool:
     return float(row["workout_calories"] or 0) > 0
+
+
+def is_profile_training_day(profile: Any, activity: Any, day: date) -> bool:
+    """Resolve diet day from a configured weekday schedule or legacy activity data."""
+    if profile["diet_mode"] != "split":
+        return False
+    schedule = profile["training_weekdays"]
+    if schedule is not None:
+        try:
+            weekdays = json.loads(schedule) if isinstance(schedule, str) else schedule
+            return day.weekday() in {int(value) for value in weekdays if 0 <= int(value) <= 6}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            # A malformed saved schedule should not crash reports; keep legacy behavior.
+            pass
+    return is_training_day(activity) if activity else False
 
 
 def weekly_activity_by_day_type(rows: list[Any]) -> dict[str, float]:

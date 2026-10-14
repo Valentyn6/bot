@@ -13,9 +13,12 @@ def test_food_logs_are_isolated_by_diet_type(tmp_path):
         profile_id = await database.create_profile(1)
         profile = await database.active_profile(1)
         assert profile["diet_mode"] == "single"
+        assert profile["training_weekdays"] is None
         await database.update_profile(profile_id, diet_mode="split")
+        await database.update_profile(profile_id, training_weekdays="[0, 3]")
         profile = await database.active_profile(1)
         assert profile["diet_mode"] == "split"
+        assert profile["training_weekdays"] == "[0, 3]"
         product_id = await database.add_food(
             1,
             {

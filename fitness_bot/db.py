@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS profiles (
     surplus_maintenance REAL NOT NULL DEFAULT 0,
     deficit_loss REAL NOT NULL DEFAULT 400,
     diet_mode TEXT NOT NULL DEFAULT 'single',
+    training_weekdays TEXT,
     protein_per_kg REAL NOT NULL DEFAULT 2,
     fat_per_kg REAL NOT NULL DEFAULT 1,
     manual_mode INTEGER NOT NULL DEFAULT 0,
@@ -302,6 +303,8 @@ class Database:
         columns = {row[1] for row in await (await self._db().execute("PRAGMA table_info(profiles)")).fetchall()}
         if "diet_mode" not in columns:
             await self._db().execute("ALTER TABLE profiles ADD COLUMN diet_mode TEXT NOT NULL DEFAULT 'single'")
+        if "training_weekdays" not in columns:
+            await self._db().execute("ALTER TABLE profiles ADD COLUMN training_weekdays TEXT")
 
     async def _migrate_finance_accounts(self) -> None:
         columns = {row[1] for row in await (await self._db().execute("PRAGMA table_info(finance_accounts)")).fetchall()}
@@ -500,7 +503,7 @@ class Database:
         return await (await self._db().execute("SELECT * FROM profiles WHERE owner_telegram_id=? ORDER BY id", (owner_id,))).fetchall()
 
     async def update_profile(self, profile_id: int, **values: Any) -> None:
-        allowed = {"name", "height", "age", "sex", "target_weight", "goal_mode", "surplus_deficit", "surplus_gain", "surplus_maintenance", "deficit_loss", "diet_mode", "protein_per_kg", "fat_per_kg", "manual_mode", "manual_weight", "manual_activity", "workout_kcal_today"}
+        allowed = {"name", "height", "age", "sex", "target_weight", "goal_mode", "surplus_deficit", "surplus_gain", "surplus_maintenance", "deficit_loss", "diet_mode", "training_weekdays", "protein_per_kg", "fat_per_kg", "manual_mode", "manual_weight", "manual_activity", "workout_kcal_today"}
         values = {key: value for key, value in values.items() if key in allowed}
         if not values:
             return

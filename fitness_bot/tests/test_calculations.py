@@ -1,11 +1,13 @@
 """Unit тести для calculations.py"""
 
 import sqlite3
+from datetime import date
 
 import pytest
 from fitness_bot.calculations import (
     calculate_targets,
     food_totals,
+    is_profile_training_day,
     normalize_date,
     parse_number,
     validate_age,
@@ -331,6 +333,29 @@ class TestWeeklyActivity:
 
         assert weekly_activity_by_day_type(rows)["training"] == 0.0
         assert weekly_activity_by_day_type(rows)["rest"] == 500.0
+
+    def test_split_diet_uses_configured_weekdays(self):
+        profile = {"diet_mode": "split", "training_weekdays": "[0, 3]"}
+        workout = {"workout_calories": 250}
+
+        assert is_profile_training_day(profile, None, date(2026, 10, 12))  # Monday, scheduled
+        assert not is_profile_training_day(profile, workout, date(2026, 10, 13))  # Tuesday, unscheduled
+
+    def test_empty_training_schedule_means_no_training_days(self):
+        profile = {"diet_mode": "split", "training_weekdays": "[]"}
+
+        assert not is_profile_training_day(profile, {"workout_calories": 250}, date(2026, 10, 12))
+
+    def test_unscheduled_split_profile_keeps_activity_autodetection(self):
+        profile = {"diet_mode": "split", "training_weekdays": None}
+
+        assert is_profile_training_day(profile, {"workout_calories": 250}, date(2026, 10, 12))
+        assert not is_profile_training_day(profile, None, date(2026, 10, 12))
+
+    def test_single_diet_ignores_training_schedule_and_activity(self):
+        profile = {"diet_mode": "single", "training_weekdays": "[0, 3]"}
+
+        assert not is_profile_training_day(profile, {"workout_calories": 250}, date(2026, 10, 12))
 
 
 class TestNormalizeDate:

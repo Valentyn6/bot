@@ -21,7 +21,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import BufferedInputFile, CallbackQuery, Document, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from .calculations import calculate_targets, food_totals, is_training_day, normalize_date, parse_number, weekly_activity, weekly_activity_by_day_type, weight_stats
+from .calculations import calculate_targets, food_totals, is_profile_training_day, is_training_day, normalize_date, parse_number, weekly_activity, weekly_activity_by_day_type, weight_stats
 from .charts import activity_chart, weight_chart
 from .config import Settings
 from .db import Database
@@ -40,6 +40,7 @@ admin_id = 0
 reminder_wakeup: asyncio.Event | None = None
 DIET_TRAINING = "training"
 DIET_REST = "rest"
+WEEKDAY_LABELS = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд")
 
 
 class WhitelistMiddleware(BaseMiddleware):
@@ -175,11 +176,22 @@ async def source_values(profile, diet_type: str | None = None, as_of_date: date 
         return weight, activity, warning
     today = end_date.isoformat()
     today_activity = next((row for row in activities if row["log_date"] == today), None)
-    training = is_training_day(today_activity) if today_activity else False
-    averages = weekly_activity_by_day_type(activities)
+    training = is_profile_training_day(profile, today_activity, end_date)
     selected_type = diet_type or ("training" if training else "rest")
-    matching_days = [row for row in activities if is_training_day(row) == (selected_type == "training")]
-    activity = averages[selected_type] if matching_days else weekly_activity(activities)
+    configured_schedule = profile["training_weekdays"]
+    if profile["diet_mode"] == "split" and configured_schedule is not None:
+        try:
+            scheduled_weekdays = {int(value) for value in json.loads(configured_schedule)}
+            matching_days = [
+                row for row in activities
+                if (date.fromisoformat(row["log_date"]).weekday() in scheduled_weekdays)
+                == (selected_type == DIET_TRAINING)
+            ]
+        except (TypeError, ValueError):
+            matching_days = [row for row in activities if is_training_day(row) == (selected_type == DIET_TRAINING)]
+    else:
+        matching_days = [row for row in activities if is_training_day(row) == (selected_type == DIET_TRAINING)]
+    activity = weekly_activity(matching_days) if matching_days else weekly_activity(activities)
     warning = ""
     if not weights and not activities:
         warning = "⚠️ Немає ні ваги, ні активності — використано дефолти: 71 кг, 0 ккал."
@@ -191,11 +203,9 @@ async def source_values(profile, diet_type: str | None = None, as_of_date: date 
 
 
 async def current_day_is_training(profile, as_of_date: date | None = None) -> bool:
-    if profile["manual_mode"]:
-        return False
     day = as_of_date or local_today()
     today = await db.activity_on_date(profile["id"], day.isoformat())
-    return is_training_day(today) if today else False
+    return is_profile_training_day(profile, today, day)
 
 
 def total_activity(row) -> float:
@@ -268,14 +278,28 @@ def settings_markup(daily_summary_time: str | None) -> InlineKeyboardMarkup:
     return buttons(rows)
 
 
+def report_food_rows(profile, food_rows, activities):
+    """Keep only the diet bucket used on each day in reports."""
+    activity_by_date = {row['log_date']: row for row in activities}
+    selected_rows = []
+    for row in food_rows:
+        activity = activity_by_date.get(row['log_date'])
+        day = date.fromisoformat(row['log_date'])
+        diet_type = DIET_TRAINING if is_profile_training_day(profile, activity, day) else DIET_REST
+        if row['diet_type'] == diet_type:
+            selected_rows.append(row)
+    return selected_rows
+
+
 async def daily_report(user_id: int, report_day: date | None = None) -> str:
     today = report_day or local_today()
     today_key = today.isoformat()
     profile = await account_profile(user_id)
     food_rows = await db.food_period(profile['id'], today_key, today_key)
-    totals = food_totals(food_rows)
     activity = await db.activity_on_date(profile['id'], today_key)
-    training = is_training_day(activity) if activity else False
+    food_rows = report_food_rows(profile, food_rows, [activity] if activity else [])
+    totals = food_totals(food_rows)
+    training = is_profile_training_day(profile, activity, today)
     diet_type = DIET_TRAINING if profile['diet_mode'] == 'split' and training else DIET_REST
     weight, activity_avg, _ = await source_values(profile, diet_type, today)
     targets = calculate_targets(profile, weight, activity_avg)
@@ -322,10 +346,11 @@ async def weekly_report(user_id: int, report_end: date | None = None) -> str:
     start = today - timedelta(days=6)
     start_key, end_key = start.isoformat(), today.isoformat()
     profile = await account_profile(user_id)
+    activities = await db.activities_between(profile['id'], start_key, end_key)
     food_rows = await db.food_period(profile['id'], start_key, end_key)
+    food_rows = report_food_rows(profile, food_rows, activities)
     totals = food_totals(food_rows)
     food_days = len({row['log_date'] for row in food_rows})
-    activities = await db.activities_between(profile['id'], start_key, end_key)
     activity_days = len(activities)
     total_steps = sum(float(row['steps']) for row in activities)
     total_active = sum(float(row['active_calories']) for row in activities)
@@ -419,10 +444,11 @@ async def monthly_report(user_id: int, report_end: date | None = None) -> str:
     previous_month_end = date(previous_month_year, previous_month_number, previous_month_end_day)
 
     profile = await account_profile(user_id)
+    activities = await db.activities_between(profile['id'], start_key, end_key)
     food_rows = await db.food_period(profile['id'], start_key, end_key)
+    food_rows = report_food_rows(profile, food_rows, activities)
     totals = food_totals(food_rows)
     food_days = len({row['log_date'] for row in food_rows})
-    activities = await db.activities_between(profile['id'], start_key, end_key)
     activity_days = len(activities)
     total_steps = sum(float(row['steps']) for row in activities)
     total_active = sum(float(row['active_calories']) for row in activities)
@@ -1063,10 +1089,51 @@ async def profile_add(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer("У кожного користувача один профіль. Змініть його параметри в розділі «Профіль».", show_alert=True)
 
 
+def saved_training_weekdays(profile) -> list[int] | None:
+    value = profile["training_weekdays"]
+    if value is None:
+        return None
+    try:
+        return sorted({int(day) for day in json.loads(value) if 0 <= int(day) <= 6})
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+
+
+def training_days_keyboard(profile) -> InlineKeyboardMarkup:
+    selected = saved_training_weekdays(profile)
+    selected_set = set(selected or [])
+    rows = [[(
+        f"{'✅' if day in selected_set else '▫️'} {label}",
+        f"dietdays:toggle:{day}",
+    )] for day, label in enumerate(WEEKDAY_LABELS)]
+    rows.extend([
+        [("🤖 Автовизначення за активністю", "dietdays:auto")],
+        [("✅ Готово", "dietdays:done")],
+    ])
+    return buttons(rows)
+
+
+def training_days_text(profile) -> str:
+    selected = saved_training_weekdays(profile)
+    if selected is None:
+        current = "Зараз: автовизначення за записом тренування."
+    elif selected:
+        current = "Зараз: " + ", ".join(WEEKDAY_LABELS[day] for day in selected) + "."
+    else:
+        current = "Зараз: днів тренування не вибрано; щодня діє звичайний раціон."
+    return (
+        "🗓 <b>Дні тренувань</b>\n\n"
+        "Оберіть дні тижня, коли використовувати тренувальний раціон. "
+        "В інші дні підсумок враховуватиме звичайний раціон.\n\n"
+        f"{current}\n\nНатискайте на день, щоб увімкнути або вимкнути його."
+    )
+
+
 @router.callback_query(F.data == "profile")
 async def profile_callback(callback: CallbackQuery) -> None:
     profile = await account_profile(callback.from_user.id)
     manual = "🖐️ Ручний режим: УВІМКНЕНО" if profile["manual_mode"] else "📡 Авторежим (з експорту здоровʼя)"
+    diet_mode = "один раціон" if profile["diet_mode"] == "single" else "тренувальний + звичайний"
     text = (
         f"👤 <b>Профіль · {profile['name']}</b>\n"
         f"━━━━━━━━━━━━━━\n"
@@ -1074,11 +1141,76 @@ async def profile_callback(callback: CallbackQuery) -> None:
         f"🎯 Ціль: <b>{profile['goal_mode']}</b>  ·  корекція {profile['surplus_deficit']:g} ккал\n"
         f"⚖️ Цільова вага: {profile['target_weight'] or 'не задана'} кг\n"
         f"🥩 Білок: {profile['protein_per_kg']:g} г/кг  ·  🥑 Жири: {profile['fat_per_kg']:g} г/кг\n"
+        f"🍽 Раціони: <b>{diet_mode}</b>\n"
         f"📊 Джерело даних: {'ручне' if profile['manual_mode'] else 'Health Export'}"
     )
-    markup = buttons([[('🎯 Набір', 'mode:набір'), ('⚖️ Підтримання', 'mode:підтримання'), ('🔥 Схуднення', 'mode:схуднення')], [('🔁 ' + manual, 'toggle_manual')], [('✏️ Зріст', 'edit:height'), ('✏️ Вік', 'edit:age'), ('✏️ Стать', 'edit:sex')], [('✏️ Цільова вага', 'edit:target_weight')], [('✏️ Ручна вага', 'edit:manual_weight'), ('✏️ Ручна активність', 'edit:manual_activity')], [('✏️ Білок/кг', 'edit:protein_per_kg'), ('✏️ Жири/кг', 'edit:fat_per_kg')], [('✏️ Профіцит/дефіцит', 'edit:surplus_deficit')], [('← До спорту і раціону', 'sport:menu')]])
+    rows = [[('🎯 Набір', 'mode:набір'), ('⚖️ Підтримання', 'mode:підтримання'), ('🔥 Схуднення', 'mode:схуднення')], [('🔁 ' + manual, 'toggle_manual')], [('✏️ Зріст', 'edit:height'), ('✏️ Вік', 'edit:age'), ('✏️ Стать', 'edit:sex')], [('✏️ Цільова вага', 'edit:target_weight')], [('✏️ Ручна вага', 'edit:manual_weight'), ('✏️ Ручна активність', 'edit:manual_activity')], [('✏️ Білок/кг', 'edit:protein_per_kg'), ('✏️ Жири/кг', 'edit:fat_per_kg')], [('✏️ Профіцит/дефіцит', 'edit:surplus_deficit')]]
+    if profile["diet_mode"] == "split":
+        selected = saved_training_weekdays(profile)
+        if selected is None:
+            text += "\n🗓 Дні тренувань: автовизначення за активністю"
+        else:
+            days = ", ".join(WEEKDAY_LABELS[day] for day in selected) if selected else "не вибрано"
+            text += f"\n🗓 Дні тренувань: {days}"
+        rows.append([('🗓 Налаштувати дні тренувань', 'dietdays:menu')])
+    rows.append([('← До спорту і раціону', 'sport:menu')])
+    markup = buttons(rows)
     await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
     await callback.answer()
+
+
+@router.callback_query(F.data == "dietdays:menu")
+async def training_days_menu(callback: CallbackQuery) -> None:
+    if await access_denied(callback):
+        return
+    profile = await account_profile(callback.from_user.id)
+    if profile["diet_mode"] != "split":
+        await callback.answer("Перемикніть профіль на два раціони, щоб налаштувати дні тренувань.", show_alert=True)
+        return
+    await callback.message.edit_text(training_days_text(profile), reply_markup=training_days_keyboard(profile), parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("dietdays:toggle:"))
+async def training_days_toggle(callback: CallbackQuery) -> None:
+    if await access_denied(callback):
+        return
+    profile = await account_profile(callback.from_user.id)
+    if profile["diet_mode"] != "split":
+        await callback.answer("Налаштування днів доступне лише для двох раціонів.", show_alert=True)
+        return
+    try:
+        day = int(callback.data.rsplit(":", 1)[1])
+        if not 0 <= day <= 6:
+            raise ValueError
+    except ValueError:
+        await callback.answer("Невідомий день тижня.", show_alert=True)
+        return
+    selected = set(saved_training_weekdays(profile) or [])
+    selected.symmetric_difference_update({day})
+    await db.update_profile(profile["id"], training_weekdays=json.dumps(sorted(selected)))
+    profile = await account_profile(callback.from_user.id)
+    await callback.message.edit_text(training_days_text(profile), reply_markup=training_days_keyboard(profile), parse_mode="HTML")
+    await callback.answer("Збережено")
+
+
+@router.callback_query(F.data == "dietdays:auto")
+async def training_days_auto(callback: CallbackQuery) -> None:
+    if await access_denied(callback):
+        return
+    profile = await account_profile(callback.from_user.id)
+    if profile["diet_mode"] != "split":
+        await callback.answer("Налаштування доступне лише для двох раціонів.", show_alert=True)
+        return
+    await db.update_profile(profile["id"], training_weekdays=None)
+    profile = await account_profile(callback.from_user.id)
+    await callback.message.edit_text(training_days_text(profile), reply_markup=training_days_keyboard(profile), parse_mode="HTML")
+    await callback.answer("Автовизначення увімкнено")
+
+
+@router.callback_query(F.data == "dietdays:done")
+async def training_days_done(callback: CallbackQuery) -> None:
+    await profile_callback(callback)
 
 
 @router.callback_query(F.data.startswith("mode:"))
