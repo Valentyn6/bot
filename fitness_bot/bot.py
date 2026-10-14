@@ -7,6 +7,7 @@ import sqlite3
 import asyncio
 import csv
 import zipfile
+import calendar
 from contextlib import suppress
 from datetime import date, datetime, timedelta
 from html import escape
@@ -251,6 +252,7 @@ def reports_markup() -> InlineKeyboardMarkup:
     return buttons([
         [('📅 Підсумок дня', 'reports:today')],
         [('🗓 Огляд за 7 днів', 'reports:week')],
+        [('📆 Підсумок місяця', 'reports:month')],
         [('← До спорту і раціону', 'sport:menu')],
     ])
 
@@ -401,6 +403,92 @@ async def weekly_report(user_id: int, report_end: date | None = None) -> str:
                 )
     if insights:
         lines.extend(["\n💡 <b>Що помітно</b>", *[f"• {escape(item)}" for item in insights[:3]]])
+    return "\n".join(lines)
+
+
+async def monthly_report(user_id: int, report_end: date | None = None) -> str:
+    """Summarize the current calendar month through report_end (today by default)."""
+    today = report_end or local_today()
+    start = today.replace(day=1)
+    start_key, end_key = start.isoformat(), today.isoformat()
+
+    previous_month_year = today.year if today.month > 1 else today.year - 1
+    previous_month_number = today.month - 1 if today.month > 1 else 12
+    previous_month_start = date(previous_month_year, previous_month_number, 1)
+    previous_month_end_day = min(today.day, calendar.monthrange(previous_month_year, previous_month_number)[1])
+    previous_month_end = date(previous_month_year, previous_month_number, previous_month_end_day)
+
+    profile = await account_profile(user_id)
+    food_rows = await db.food_period(profile['id'], start_key, end_key)
+    totals = food_totals(food_rows)
+    food_days = len({row['log_date'] for row in food_rows})
+    activities = await db.activities_between(profile['id'], start_key, end_key)
+    activity_days = len(activities)
+    total_steps = sum(float(row['steps']) for row in activities)
+    total_active = sum(float(row['active_calories']) for row in activities)
+    sleeps = await db.sleeps_between(profile['id'], start_key, end_key)
+    sleep_rows = [row for row in sleeps if row['asleep_sec'] > 0]
+    habits = await db.habit_period_summary(user_id, start_key, end_key)
+    finance = await db.finance_report_summary(user_id, start_key, end_key)
+    previous_finance = await db.finance_report_summary(
+        user_id, previous_month_start.isoformat(), previous_month_end.isoformat()
+    )
+
+    lines = [
+        f"📆 <b>Підсумок місяця · {start.strftime('%d.%m')}–{today.strftime('%d.%m.%Y')}</b>",
+        "",
+        "Поточний календарний місяць на цей день.",
+    ]
+    if food_days:
+        lines.extend([
+            f"\n🥗 <b>Раціон</b>",
+            f"Записи за {food_days} із {today.day} днів · у середньому {totals['calories'] / food_days:,.0f} ккал за день із записами",
+            f"Середнє КБЖУ: Б {totals['protein'] / food_days:.0f} г · Ж {totals['fat'] / food_days:.0f} г · В {totals['carbs'] / food_days:.0f} г",
+        ])
+    else:
+        lines.append("\n🥗 <b>Раціон:</b> записів за цей місяць поки немає.")
+
+    if activity_days:
+        lines.append(
+            f"\n🏃 <b>Активність</b>\n{total_steps:,.0f} кроків · {total_active:,.0f} активних ккал "
+            f"за {activity_days} дн. з даними"
+        )
+    else:
+        lines.append("\n🏃 <b>Активність:</b> даних за цей місяць поки немає.")
+
+    if sleep_rows:
+        avg_sleep = sum(float(row['asleep_sec']) for row in sleep_rows) / len(sleep_rows) / 3600
+        lines.append(f"\n😴 <b>Сон:</b> у середньому {avg_sleep:.1f} год за {len(sleep_rows)} ночей з даними")
+
+    if habits['habits']:
+        habit_rate = round(habits['completed'] / habits['opportunities'] * 100) if habits['opportunities'] else 0
+        lines.append(
+            f"\n🔁 <b>Звички:</b> виконано {habits['completed']} із {habits['opportunities']} "
+            f"можливих відміток ({habit_rate}%)."
+        )
+    else:
+        lines.append("\n🔁 <b>Звички:</b> активних звичок поки немає.")
+
+    if finance:
+        lines.append("\n💳 <b>Фінанси</b>")
+        previous_by_currency = {int(row['currency_code']): row for row in previous_finance}
+        for row in finance:
+            currency = int(row['currency_code'])
+            expenses = int(row['expenses'])
+            income = int(row['income'])
+            lines.append(f"Витрати {money(expenses, currency)} · доходи {money(income, currency)}")
+            previous = previous_by_currency.get(currency)
+            if previous and int(previous['expenses']) > 0:
+                old_expenses = int(previous['expenses'])
+                change = round((expenses - old_expenses) / old_expenses * 100)
+                direction = "більше" if change > 0 else "менше" if change < 0 else "так само"
+                lines.append(
+                    f"Порівняно з 1–{previous_month_end.day} {previous_month_start.strftime('%m')}: "
+                    f"{abs(change)}% {direction} витрат ({money(old_expenses, currency)} раніше)."
+                )
+    else:
+        lines.append("\n💳 <b>Фінанси:</b> операцій за цей місяць поки немає.")
+
     return "\n".join(lines)
 
 
@@ -754,6 +842,18 @@ async def weekly_report_callback(callback: CallbackQuery) -> None:
         return
     await callback.message.edit_text(
         await weekly_report(callback.from_user.id),
+        reply_markup=reports_markup(),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "reports:month")
+async def monthly_report_callback(callback: CallbackQuery) -> None:
+    if await access_denied(callback):
+        return
+    await callback.message.edit_text(
+        await monthly_report(callback.from_user.id),
         reply_markup=reports_markup(),
         parse_mode="HTML",
     )
