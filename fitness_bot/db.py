@@ -21,6 +21,9 @@ SCHEMA = """
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS telegram_accounts (
     telegram_id INTEGER PRIMARY KEY,
+    username TEXT,
+    first_name TEXT,
+    last_name TEXT,
     active_profile_id INTEGER,
     managed_profile_id INTEGER,
     access_status TEXT NOT NULL DEFAULT 'pending',
@@ -279,6 +282,9 @@ class Database:
     async def _migrate_accounts(self) -> None:
         columns = {row[1] for row in await (await self._db().execute("PRAGMA table_info(telegram_accounts)")).fetchall()}
         migrations = {
+            "username": "TEXT",
+            "first_name": "TEXT",
+            "last_name": "TEXT",
             "managed_profile_id": "INTEGER",
             "access_status": "TEXT NOT NULL DEFAULT 'approved'",
             "is_admin": "INTEGER NOT NULL DEFAULT 0",
@@ -424,6 +430,13 @@ class Database:
         )
         await db.commit()
         return await (await db.execute("SELECT * FROM telegram_accounts WHERE telegram_id=?", (telegram_id,))).fetchone(), True
+
+    async def update_telegram_identity(self, telegram_id: int, username: str | None, first_name: str | None, last_name: str | None) -> None:
+        await self._db().execute(
+            "UPDATE telegram_accounts SET username=?, first_name=?, last_name=? WHERE telegram_id=?",
+            (username, first_name, last_name, telegram_id),
+        )
+        await self._db().commit()
 
     async def account(self, telegram_id: int) -> aiosqlite.Row | None:
         return await (await self._db().execute("SELECT * FROM telegram_accounts WHERE telegram_id=?", (telegram_id,))).fetchone()

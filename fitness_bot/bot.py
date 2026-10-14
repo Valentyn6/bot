@@ -54,6 +54,10 @@ class WhitelistMiddleware(BaseMiddleware):
         is_start = command == "/start" or command.startswith("/start@")
         try:
             account, _ = await db.ensure_account(user_id)
+            identity = (user.username, user.first_name, user.last_name)
+            saved_identity = (account["username"], account["first_name"], account["last_name"])
+            if identity != saved_identity:
+                await db.update_telegram_identity(user_id, *identity)
         except Exception:
             logging.exception("Access check failed for Telegram user %s", user_id)
             if isinstance(event, CallbackQuery):
@@ -150,8 +154,11 @@ def admin_markup(accounts) -> InlineKeyboardMarkup:
     rows = []
     for account in accounts:
         status = {"approved": "✅", "pending": "⏳", "rejected": "❌", "banned": "⛔"}.get(account["access_status"], "❔")
-        diet = "раціон дозволено" if account["can_manage_diet"] else "раціон лише коуч"
-        rows.append([(f"{status} {account['telegram_id']} · {diet}", f"adm:user:{account['telegram_id']}")])
+        username = account["username"]
+        display_name = " ".join(part for part in (account["first_name"], account["last_name"]) if part)
+        identity = f"@{username}" if username else (display_name or "без ніку")
+        identity = identity[:38]
+        rows.append([(f"{status} {account['telegram_id']} · {identity}", f"adm:user:{account['telegram_id']}")])
     rows += [[("← Головне меню", "home")]]
     return buttons(rows)
 
@@ -975,7 +982,19 @@ async def admin_user(callback: CallbackQuery) -> None:
     profile = await admin_target_profile(user_id, profiles)
     status = {"approved": "схвалений", "pending": "очікує", "rejected": "відхилений", "banned": "заблокований"}.get(account["access_status"], account["access_status"])
     diet_mode = "окремі раціони: тренувальний + звичайний" if profile["diet_mode"] == "split" else "один раціон"
-    text = f"👤 <b>Користувач {user_id}</b>\n\nСтатус: {status}\nПрофіль: {profile['name']}\nРежим: <b>{profile['goal_mode']}</b>\nТип раціонів: <b>{diet_mode}</b>\nСамостійний раціон: {'дозволено' if account['can_manage_diet'] else 'заборонено'}"
+    username = f"@{account['username']}" if account["username"] else "не задано"
+    display_name = " ".join(part for part in (account["first_name"], account["last_name"]) if part) or "не вказане"
+    text = (
+        f"👤 <b>Користувач</b>\n"
+        f"ID: <code>{user_id}</code>\n"
+        f"Нік: {escape(username)}\n"
+        f"Ім’я: {escape(display_name)}\n\n"
+        f"Статус: {escape(status)}\n"
+        f"Профіль: {escape(profile['name'])}\n"
+        f"Режим: <b>{escape(profile['goal_mode'])}</b>\n"
+        f"Тип раціонів: <b>{escape(diet_mode)}</b>\n"
+        f"Самостійний раціон: {'дозволено' if account['can_manage_diet'] else 'заборонено'}"
+    )
     actions = []
     if account["access_status"] == "approved":
         actions.append([("🎯 Набір", f"adm:mode:{user_id}:набір"), ("⚖️ Підтримання", f"adm:mode:{user_id}:підтримання")])
@@ -991,7 +1010,7 @@ async def admin_user(callback: CallbackQuery) -> None:
     if account["access_status"] == "banned":
         actions.append([("♻️ Розблокувати", f"adm:unban:{user_id}")])
     actions.append([("← До списку", "admin")])
-    await callback.message.edit_text(text, reply_markup=buttons(actions))
+    await callback.message.edit_text(text, reply_markup=buttons(actions), parse_mode="HTML")
     await callback.answer()
 
 
