@@ -144,13 +144,19 @@ async def render_program(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
                 else "вагу не вказано"
             )
             lines.append(f"  • {escape(exercise['name_snapshot'])} — <b>{current_weight}</b>")
-            rows.append([
-                (f"📈 {exercise['name_snapshot'][:24]}", f"training:chart:{exercise['id']}"),
-                (f"⚖️ {exercise['current_weight']:g} кг" if exercise["current_weight"] is not None else "⚖️ Вага —", f"training:weight:{exercise['id']}"),
-            ])
-            rows.append([("🗑 Видалити вправу", f"training:remove-ex:{exercise['id']}")])
-        rows.append([(f"✅ Виконано: {day['title'][:24]}", f"training:done:{day['id']}"), ("➕ Вправи", f"training:add-ex:{day['id']}")])
-        rows.append([("✏️ Назва дня", f"training:edit-day:{day['id']}"), ("🗑 Видалити день", f"training:remove-day:{day['id']}")])
+            rows.append([(
+                f"⚖️ {exercise['current_weight']:g} кг" if exercise["current_weight"] is not None else "⚖️ Вага —",
+                f"training:weight:{exercise['id']}"
+            )])
+        rows.append([
+            (f"✅ Виконано: {day['title'][:20]}", f"training:done:{day['id']}"),
+            ("➕ Вправу", f"training:add-ex:{day['id']}"),
+        ])
+        rows.append([
+            ("✏️ Назва дня", f"training:edit-day:{day['id']}"),
+            ("🗑 Вправу", f"training:manage-ex:{day['id']}"),
+            ("🗑 День", f"training:remove-day:{day['id']}"),
+        ])
         lines.append("")
     if not days:
         lines.append("Додайте перший тренувальний день.")
@@ -460,18 +466,6 @@ async def finish_day(callback: CallbackQuery) -> None:
     await show(callback)
 
 
-@router.callback_query(F.data.startswith("training:chart:"))
-async def exercise_chart(callback: CallbackQuery) -> None:
-    exercise_id = int(callback.data.rsplit(":", 1)[1])
-    pid = await profile_id(callback.from_user.id)
-    conn = db()._db()
-    exercise = await (await conn.execute("SELECT e.name_snapshot FROM training_program_exercises e JOIN training_days d ON d.id=e.day_id JOIN training_programs p ON p.id=d.program_id WHERE e.id=? AND p.profile_id=?", (exercise_id, pid))).fetchone()
-    if not exercise:
-        await callback.answer("Вправу не знайдено.", show_alert=True)
-        return
-    await send_progress_chart(callback, pid, exercise["name_snapshot"])
-
-
 async def send_progress_chart(callback: CallbackQuery, pid: int, exercise_name: str) -> None:
     conn = db()._db()
     rows = await (await conn.execute("SELECT s.session_date AS log_date,l.weight FROM training_exercise_logs l JOIN training_sessions s ON s.id=l.session_id WHERE s.profile_id=? AND l.exercise_name=? AND l.weight IS NOT NULL ORDER BY s.session_date", (pid, exercise_name))).fetchall()
@@ -522,6 +516,26 @@ async def remove_exercise(callback: CallbackQuery) -> None:
     await db()._db().commit()
     await show(callback)
     await callback.answer("Вправу видалено")
+
+
+@router.callback_query(F.data.startswith("training:manage-ex:"))
+async def manage_exercises(callback: CallbackQuery) -> None:
+    day_id = int(callback.data.rsplit(":", 1)[1])
+    pid = await profile_id(callback.from_user.id)
+    day = await (await db()._db().execute(
+        "SELECT d.title FROM training_days d JOIN training_programs p ON p.id=d.program_id WHERE d.id=? AND p.profile_id=?",
+        (day_id, pid),
+    )).fetchone()
+    if not day:
+        await callback.answer("День не знайдено.", show_alert=True)
+        return
+    exercises = await (await db()._db().execute(
+        "SELECT id,name_snapshot FROM training_program_exercises WHERE day_id=? ORDER BY order_index,id", (day_id,)
+    )).fetchall()
+    rows = [[(f"🗑 {exercise['name_snapshot'][:45]}", f"training:remove-ex:{exercise['id']}")] for exercise in exercises]
+    rows.append([("← До програми", "training:menu")])
+    await callback.message.edit_text(f"Оберіть вправу для видалення з дня <b>{escape(day['title'])}</b>:", reply_markup=kb(rows), parse_mode="HTML")
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("training:remove-day:"))
