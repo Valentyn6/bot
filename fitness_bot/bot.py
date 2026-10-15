@@ -31,6 +31,8 @@ from .finance import router as finance_router
 from .finance.router import configure as configure_finance, money
 from .goals import router as goals_router
 from .goals.router import configure as configure_goals
+from .reflection import router as reflection_router
+from .reflection.router import configure as configure_reflection
 from .time_utils import APP_TIMEZONE, local_today
 
 
@@ -247,6 +249,7 @@ async def home_markup(user_id: int) -> InlineKeyboardMarkup:
         [('🥗 Спорт і Раціон', 'sport:menu')],
         [('💳 Фінанси', 'finance:menu')],
         [('🎯 Цілі та звички', 'goals:menu')],
+        [('🪞 Рефлексія', 'reflection:menu')],
     ]
     if await is_admin(user_id):
         rows.append([('🛡 Адмін-панель', 'admin')])
@@ -737,7 +740,7 @@ async def send_user_export(message: Message) -> None:
             bundle.writestr(f"{table}.csv", output.getvalue().encode("utf-8-sig"))
     await message.answer_document(
         BufferedInputFile(archive.getvalue(), filename=f"my_bot_data_{local_today().isoformat()}.zip"),
-        caption="📤 Ваші дані збережено в окремих CSV-файлах. Архів містить раціон, здоров’я, фінанси, цілі та звички.",
+        caption="📤 Ваші дані збережено в окремих CSV-файлах. Архів містить раціон, здоров’я, фінанси, цілі, звички та записи рефлексії.",
     )
 
 
@@ -2143,6 +2146,7 @@ async def main() -> None:
         if not admin_id:
             raise RuntimeError("Адміністратора не налаштовано. Вкажіть ADMIN_TELEGRAM_ID у .env або відновіть наявний доступ адміністратора у базі.")
         configure_finance(db)
+        configure_reflection(db)
         bot = Bot(settings.bot_token)
         reminder_wakeup = asyncio.Event()
         configure_goals(db, reminder_wakeup)
@@ -2153,6 +2157,7 @@ async def main() -> None:
         dispatcher.include_router(router)
         dispatcher.include_router(finance_router)
         dispatcher.include_router(goals_router)
+        dispatcher.include_router(reflection_router)
         await dispatcher.start_polling(bot)
     except TelegramUnauthorizedError as exc:
         logger.critical("Telegram відхилив BOT_TOKEN. Перевірте .env і токен у @BotFather.")

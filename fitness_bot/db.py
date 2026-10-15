@@ -255,6 +255,33 @@ CREATE TABLE IF NOT EXISTS habit_logs (
     FOREIGN KEY(habit_id) REFERENCES habits(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_habit_logs_habit_date ON habit_logs(habit_id, log_date);
+CREATE TABLE IF NOT EXISTS reflection_entries (
+    telegram_id INTEGER NOT NULL,
+    entry_date TEXT NOT NULL,
+    good TEXT NOT NULL DEFAULT '',
+    challenge TEXT NOT NULL DEFAULT '',
+    self_care TEXT NOT NULL DEFAULT '',
+    tomorrow TEXT NOT NULL DEFAULT '',
+    mood INTEGER,
+    energy INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(telegram_id, entry_date),
+    FOREIGN KEY(telegram_id) REFERENCES telegram_accounts(telegram_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_reflection_entries_user_date ON reflection_entries(telegram_id, entry_date DESC);
+CREATE TABLE IF NOT EXISTS weekly_reflections (
+    telegram_id INTEGER NOT NULL,
+    week_start TEXT NOT NULL,
+    energy_sources TEXT NOT NULL DEFAULT '',
+    patterns TEXT NOT NULL DEFAULT '',
+    proud_of TEXT NOT NULL DEFAULT '',
+    next_week TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(telegram_id, week_start),
+    FOREIGN KEY(telegram_id) REFERENCES telegram_accounts(telegram_id) ON DELETE CASCADE
+);
 """
 
 class Database:
@@ -274,10 +301,17 @@ class Database:
         await self._migrate_finance_auto_rules()
         await self._migrate_finance_transactions()
         await self._migrate_finance_accounts()
+        await self._migrate_reflection_entries()
         habit_columns = {row[1] for row in await (await self._db().execute("PRAGMA table_info(habits)")).fetchall()}
         if "last_reminder_date" not in habit_columns:
             await self._db().execute("ALTER TABLE habits ADD COLUMN last_reminder_date TEXT")
         await self.conn.commit()
+
+    async def _migrate_reflection_entries(self) -> None:
+        columns = {row[1] for row in await (await self._db().execute("PRAGMA table_info(reflection_entries)")).fetchall()}
+        for column in ("mood", "energy"):
+            if column not in columns:
+                await self._db().execute(f"ALTER TABLE reflection_entries ADD COLUMN {column} INTEGER")
 
     async def _migrate_accounts(self) -> None:
         columns = {row[1] for row in await (await self._db().execute("PRAGMA table_info(telegram_accounts)")).fetchall()}
@@ -1295,6 +1329,76 @@ class Database:
         completed = {row["log_date"] for row in rows}
         return [(date.fromisoformat(week_start) + timedelta(days=offset)).isoformat() in completed for offset in range(7)]
 
+    async def reflection_entry(self, telegram_id: int, entry_date: str) -> aiosqlite.Row | None:
+        return await (await self._db().execute(
+            "SELECT * FROM reflection_entries WHERE telegram_id=? AND entry_date=?",
+            (telegram_id, entry_date),
+        )).fetchone()
+
+    async def reflection_entries(self, telegram_id: int, limit: int = 14) -> list[aiosqlite.Row]:
+        return await (await self._db().execute(
+            "SELECT * FROM reflection_entries WHERE telegram_id=? ORDER BY entry_date DESC LIMIT ?",
+            (telegram_id, limit),
+        )).fetchall()
+
+    async def reflection_entries_between(self, telegram_id: int, start_date: str, end_date: str) -> list[aiosqlite.Row]:
+        return await (await self._db().execute(
+            "SELECT * FROM reflection_entries WHERE telegram_id=? AND entry_date BETWEEN ? AND ? ORDER BY entry_date",
+            (telegram_id, start_date, end_date),
+        )).fetchall()
+
+    async def save_reflection(self, telegram_id: int, entry_date: str, answers: dict[str, Any]) -> None:
+        now = datetime.now().isoformat(timespec="seconds")
+        await self._db().execute(
+            """INSERT INTO reflection_entries(telegram_id, entry_date, good, challenge, self_care, tomorrow, mood, energy, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(telegram_id, entry_date) DO UPDATE SET
+                   good=excluded.good, challenge=excluded.challenge, self_care=excluded.self_care,
+                   tomorrow=excluded.tomorrow, mood=excluded.mood, energy=excluded.energy, updated_at=excluded.updated_at""",
+            (telegram_id, entry_date, answers.get("good", ""), answers.get("challenge", ""), answers.get("self_care", ""), answers.get("tomorrow", ""), answers.get("mood"), answers.get("energy"), now, now),
+        )
+        await self._db().commit()
+
+    async def weekly_reflection(self, telegram_id: int, week_start: str) -> aiosqlite.Row | None:
+        return await (await self._db().execute(
+            "SELECT * FROM weekly_reflections WHERE telegram_id=? AND week_start=?",
+            (telegram_id, week_start),
+        )).fetchone()
+
+    async def weekly_reflections(self, telegram_id: int, limit: int = 12) -> list[aiosqlite.Row]:
+        return await (await self._db().execute(
+            "SELECT * FROM weekly_reflections WHERE telegram_id=? ORDER BY week_start DESC LIMIT ?",
+            (telegram_id, limit),
+        )).fetchall()
+
+    async def save_weekly_reflection(self, telegram_id: int, week_start: str, answers: dict[str, str]) -> None:
+        now = datetime.now().isoformat(timespec="seconds")
+        await self._db().execute(
+            """INSERT INTO weekly_reflections(telegram_id, week_start, energy_sources, patterns, proud_of, next_week, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(telegram_id, week_start) DO UPDATE SET
+                   energy_sources=excluded.energy_sources, patterns=excluded.patterns,
+                   proud_of=excluded.proud_of, next_week=excluded.next_week, updated_at=excluded.updated_at""",
+            (telegram_id, week_start, answers.get("energy_sources", ""), answers.get("patterns", ""), answers.get("proud_of", ""), answers.get("next_week", ""), now, now),
+        )
+        await self._db().commit()
+
+    async def delete_weekly_reflection(self, telegram_id: int, week_start: str) -> bool:
+        cur = await self._db().execute(
+            "DELETE FROM weekly_reflections WHERE telegram_id=? AND week_start=?",
+            (telegram_id, week_start),
+        )
+        await self._db().commit()
+        return cur.rowcount > 0
+
+    async def delete_reflection_entry(self, telegram_id: int, entry_date: str) -> bool:
+        cur = await self._db().execute(
+            "DELETE FROM reflection_entries WHERE telegram_id=? AND entry_date=?",
+            (telegram_id, entry_date),
+        )
+        await self._db().commit()
+        return cur.rowcount > 0
+
     async def export_all(self, owner_id: int) -> dict[str, Any]:
         result: dict[str, Any] = {}
         own_queries = {
@@ -1306,6 +1410,8 @@ class Database:
             "finance_transactions": ("SELECT t.*, c.name AS category_name FROM finance_transactions t LEFT JOIN finance_categories c ON c.id=t.category_id WHERE t.telegram_id=?", (owner_id,)),
             "finance_goals": ("SELECT * FROM goals WHERE telegram_id=?", (owner_id,)),
             "habits": ("SELECT * FROM habits WHERE telegram_id=?", (owner_id,)),
+            "reflections": ("SELECT * FROM reflection_entries WHERE telegram_id=? ORDER BY entry_date", (owner_id,)),
+            "weekly_reflections": ("SELECT * FROM weekly_reflections WHERE telegram_id=? ORDER BY week_start", (owner_id,)),
             "monobank_accounts": ("SELECT id, telegram_id, token_hint, created_at, updated_at FROM monobank_accounts WHERE telegram_id=?", (owner_id,)),
             "auto_rules": ("SELECT * FROM finance_auto_rules WHERE telegram_id=?", (owner_id,)),
         }
