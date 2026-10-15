@@ -144,10 +144,10 @@ async def render_program(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
                 else "вагу не вказано"
             )
             lines.append(f"  • {escape(exercise['name_snapshot'])} — <b>{current_weight}</b>")
-            rows.append([(
-                f"⚖️ {exercise['current_weight']:g} кг" if exercise["current_weight"] is not None else "⚖️ Вага —",
-                f"training:weight:{exercise['id']}"
-            )])
+            rows.append([
+                (f"📈 {exercise['name_snapshot'][:22]}", f"training:history-chart-by-name:{exercise['id']}"),
+                (f"⚖️ {exercise['current_weight']:g} кг" if exercise["current_weight"] is not None else "⚖️ Вага —", f"training:weight:{exercise['id']}"),
+            ])
         rows.append([
             (f"✅ Виконано: {day['title'][:20]}", f"training:done:{day['id']}"),
             ("➕ Вправу", f"training:add-ex:{day['id']}"),
@@ -506,6 +506,21 @@ async def history_chart(callback: CallbackQuery) -> None:
         await callback.answer("Вправу не знайдено.", show_alert=True)
         return
     await send_progress_chart(callback, await profile_id(callback.from_user.id), row["name"])
+
+
+@router.callback_query(F.data.startswith("training:history-chart-by-name:"))
+async def current_exercise_chart(callback: CallbackQuery) -> None:
+    exercise_id = int(callback.data.rsplit(":", 1)[1])
+    pid = await profile_id(callback.from_user.id)
+    exercise = await (await db()._db().execute(
+        "SELECT e.name_snapshot FROM training_program_exercises e "
+        "JOIN training_days d ON d.id=e.day_id JOIN training_programs p ON p.id=d.program_id "
+        "WHERE e.id=? AND p.profile_id=?", (exercise_id, pid),
+    )).fetchone()
+    if not exercise:
+        await callback.answer("Вправу не знайдено.", show_alert=True)
+        return
+    await send_progress_chart(callback, pid, exercise["name_snapshot"])
 
 
 @router.callback_query(F.data.startswith("training:remove-ex:"))
