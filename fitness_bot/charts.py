@@ -35,3 +35,23 @@ def activity_chart(rows: list[Any], field: str, title: str, ylabel: str) -> Path
     else:
         values = [row[field] for row in rows]
     return _chart(title, [row["log_date"] for row in rows], values, ylabel)
+
+
+def exercise_progress_chart(rows: list[Any], exercise_name: str) -> Path:
+    handle = NamedTemporaryFile(prefix="training_", suffix=".png", delete=False)
+    path = Path(handle.name)
+    handle.close()
+    fig, axis = plt.subplots(figsize=(9, 4.5))
+    axis.plot(
+        [row["log_date"] for row in rows],
+        [row["weight"] for row in rows],
+        marker="o", linewidth=2, color="#176b87",
+    )
+    axis.set_title(f"Прогрес: {exercise_name}")
+    axis.set_ylabel("Вага, кг")
+    axis.grid(alpha=0.25)
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    return path

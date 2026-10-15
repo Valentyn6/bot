@@ -282,6 +282,60 @@ CREATE TABLE IF NOT EXISTS weekly_reflections (
     PRIMARY KEY(telegram_id, week_start),
     FOREIGN KEY(telegram_id) REFERENCES telegram_accounts(telegram_id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS training_exercises (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_telegram_id INTEGER,
+    name TEXT NOT NULL COLLATE NOCASE,
+    muscle_group TEXT NOT NULL DEFAULT 'Інше',
+    created_at TEXT NOT NULL,
+    UNIQUE(owner_telegram_id, name),
+    FOREIGN KEY(owner_telegram_id) REFERENCES telegram_accounts(telegram_id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS training_programs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_id INTEGER NOT NULL UNIQUE,
+    name TEXT NOT NULL DEFAULT 'Моя програма',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(profile_id) REFERENCES profiles(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS training_days (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    program_id INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    order_index INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY(program_id) REFERENCES training_programs(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS training_program_exercises (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    day_id INTEGER NOT NULL,
+    exercise_id INTEGER,
+    name_snapshot TEXT NOT NULL,
+    muscle_group TEXT NOT NULL DEFAULT 'Інше',
+    prescription TEXT NOT NULL DEFAULT '',
+    current_weight REAL,
+    order_index INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY(day_id) REFERENCES training_days(id) ON DELETE CASCADE,
+    FOREIGN KEY(exercise_id) REFERENCES training_exercises(id) ON DELETE SET NULL
+);
+CREATE TABLE IF NOT EXISTS training_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_id INTEGER NOT NULL,
+    day_title TEXT NOT NULL,
+    session_date TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(profile_id, day_title, session_date),
+    FOREIGN KEY(profile_id) REFERENCES profiles(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS training_exercise_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL,
+    exercise_name TEXT NOT NULL,
+    weight REAL,
+    FOREIGN KEY(session_id) REFERENCES training_sessions(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_training_sessions_profile_date ON training_sessions(profile_id, session_date);
+CREATE INDEX IF NOT EXISTS idx_training_logs_name ON training_exercise_logs(exercise_name);
 """
 
 class Database:
@@ -1419,11 +1473,29 @@ class Database:
             rows = await (await self._db().execute(query, params)).fetchall()
             result[table] = [dict(row) for row in rows]
         profile_ids = [row["id"] for row in await (await self._db().execute("SELECT id FROM profiles WHERE owner_telegram_id=?", (owner_id,))).fetchall()]
-        for table in ("food_log", "weight_log", "activity_log", "sleep_log", "meal_templates"):
+        for table in ("food_log", "weight_log", "activity_log", "sleep_log", "meal_templates", "training_programs"):
             result[table] = []
             for profile_id in profile_ids:
                 rows = await (await self._db().execute(f"SELECT * FROM {table} WHERE profile_id=?", (profile_id,))).fetchall()
                 result[table].extend(dict(row) for row in rows)
+        result["training_days"] = []
+        result["training_program_exercises"] = []
+        result["training_sessions"] = []
+        result["training_exercise_logs"] = []
+        for profile_id in profile_ids:
+            program_ids = [r["id"] for r in await (await self._db().execute("SELECT id FROM training_programs WHERE profile_id=?", (profile_id,))).fetchall()]
+            for program_id in program_ids:
+                days = await (await self._db().execute("SELECT * FROM training_days WHERE program_id=?", (program_id,))).fetchall()
+                result["training_days"].extend(dict(r) for r in days)
+                for day in days:
+                    exercises = await (await self._db().execute("SELECT * FROM training_program_exercises WHERE day_id=?", (day["id"],))).fetchall()
+                    result["training_program_exercises"].extend(dict(r) for r in exercises)
+            sessions = await (await self._db().execute("SELECT * FROM training_sessions WHERE profile_id=?", (profile_id,))).fetchall()
+            result["training_sessions"].extend(dict(r) for r in sessions)
+            for session in sessions:
+                logs = await (await self._db().execute("SELECT * FROM training_exercise_logs WHERE session_id=?", (session["id"],))).fetchall()
+                result["training_exercise_logs"].extend(dict(r) for r in logs)
+        result["custom_training_exercises"] = [dict(r) for r in await (await self._db().execute("SELECT * FROM training_exercises WHERE owner_telegram_id=?", (owner_id,))).fetchall()]
         habit_ids = [row["id"] for row in await (await self._db().execute("SELECT id FROM habits WHERE telegram_id=?", (owner_id,))).fetchall()]
         result["habit_logs"] = []
         for habit_id in habit_ids:

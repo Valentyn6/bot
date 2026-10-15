@@ -33,6 +33,7 @@ from .goals import router as goals_router
 from .goals.router import configure as configure_goals
 from .reflection import router as reflection_router
 from .reflection.router import configure as configure_reflection
+from .training.router import configure as configure_training, router as training_router
 from .time_utils import APP_TIMEZONE, local_today
 
 
@@ -261,6 +262,7 @@ async def sport_markup(user_id: int) -> InlineKeyboardMarkup:
     rows = [
         [('🍽 Раціон', 'food'), ('⚖️ Вага', 'weight')],
         [('📊 Підсумки', 'reports:menu')],
+        [('🏋️ Тренувальна програма', 'training:menu')],
         [('📈 Графіки', 'charts'), ('🩺 Здоровʼя', 'health')],
         [('👤 Профіль', 'profile'), ('⋯ Ще', 'more')],
         [('← Головне меню', 'home')],
@@ -740,7 +742,7 @@ async def send_user_export(message: Message) -> None:
             bundle.writestr(f"{table}.csv", output.getvalue().encode("utf-8-sig"))
     await message.answer_document(
         BufferedInputFile(archive.getvalue(), filename=f"my_bot_data_{local_today().isoformat()}.zip"),
-        caption="📤 Ваші дані збережено в окремих CSV-файлах. Архів містить раціон, здоров’я, фінанси, цілі, звички та записи рефлексії.",
+        caption="📤 Ваші дані збережено в окремих CSV-файлах. Архів містить раціон, здоров’я, тренувальну програму й історію, фінанси, цілі, звички та записи рефлексії.",
     )
 
 
@@ -2147,6 +2149,7 @@ async def main() -> None:
             raise RuntimeError("Адміністратора не налаштовано. Вкажіть ADMIN_TELEGRAM_ID у .env або відновіть наявний доступ адміністратора у базі.")
         configure_finance(db)
         configure_reflection(db)
+        configure_training(db)
         bot = Bot(settings.bot_token)
         reminder_wakeup = asyncio.Event()
         configure_goals(db, reminder_wakeup)
@@ -2158,6 +2161,7 @@ async def main() -> None:
         dispatcher.include_router(finance_router)
         dispatcher.include_router(goals_router)
         dispatcher.include_router(reflection_router)
+        dispatcher.include_router(training_router)
         await dispatcher.start_polling(bot)
     except TelegramUnauthorizedError as exc:
         logger.critical("Telegram відхилив BOT_TOKEN. Перевірте .env і токен у @BotFather.")
