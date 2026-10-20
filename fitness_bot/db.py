@@ -693,6 +693,21 @@ class Database:
             await db.rollback()
             raise ValueError("Не вдалося додати продукт: запис або продукт уже не актуальні. Оновіть раціон.") from exc
 
+    async def add_food_log_quantity(self, profile_id: int, log_date: str, diet_type: str, product_id: int, quantity: float) -> bool:
+        """Add quantity to an existing matching food entry, or create a recommendation entry."""
+        db = self._db()
+        cur = await db.execute(
+            "UPDATE food_log SET quantity = quantity + ? "
+            "WHERE id = (SELECT id FROM food_log WHERE profile_id=? AND log_date=? "
+            "AND diet_type=? AND product_id=? ORDER BY id LIMIT 1)",
+            (quantity, profile_id, log_date, diet_type, product_id),
+        )
+        if cur.rowcount:
+            await db.commit()
+            return True
+        await self.add_food_log(profile_id, log_date, "Рекомендація", product_id, quantity, diet_type)
+        return False
+
     async def food_day(self, profile_id: int, log_date: str, diet_type: str = "rest") -> list[aiosqlite.Row]:
         return await (await self._db().execute("SELECT l.*, f.name, f.protein, f.fat, f.carbs, f.calories, f.unit FROM food_log l JOIN food_database f ON f.id=l.product_id WHERE l.profile_id=? AND l.log_date=? AND l.diet_type=? ORDER BY l.id", (profile_id, log_date, diet_type))).fetchall()
 

@@ -1464,14 +1464,16 @@ async def food_advice_add(callback: CallbackQuery) -> None:
         await callback.answer("Рекомендація вже додана", show_alert=True)
         return
     try:
-        await db.add_food_log(profile["id"], log_date, "Рекомендація", product_id, quantity, diet_type)
+        merged = any(row["product_id"] == product_id for row in rows)
+        await db.add_food_log_quantity(profile["id"], log_date, diet_type, product_id, quantity)
     except ValueError as exc:
         await callback.answer(str(exc), show_alert=True)
         await food_advice(callback)
         return
     text, markup = await food_screen(callback.from_user.id, diet_type)
-    await callback.message.edit_text("✅ Рекомендацію додано.\n\n" + text, reply_markup=markup)
-    await callback.answer("Додано")
+    result = "✅ Порцію рекомендації додано до вже записаного продукту." if merged else "✅ Рекомендацію додано до раціону."
+    await callback.message.edit_text(result + "\n\n" + text, reply_markup=markup)
+    await callback.answer("Порцію збільшено" if merged else "Додано")
 
 
 @router.callback_query(F.data.startswith("food_add:"))
