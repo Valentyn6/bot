@@ -8,6 +8,8 @@ import asyncio
 import csv
 import zipfile
 import calendar
+import os
+import tempfile
 from contextlib import suppress
 from datetime import date, datetime, timedelta
 from html import escape
@@ -25,6 +27,7 @@ from .calculations import calculate_targets, food_totals, is_profile_training_da
 from .charts import activity_chart, weight_chart
 from .config import Settings
 from .db import Database
+from .backup import BackupError, make_backup_archive, read_backup_archive
 from .import_health import ImportErrorMessage, parse_food_database, parse_health_export
 from .logger_config import setup_logging
 from .finance import router as finance_router
@@ -40,14 +43,40 @@ from .time_utils import APP_TIMEZONE, local_today
 router = Router()
 db: Database
 admin_id = 0
+backup_encryption_key = ""
+maintenance_mode = False
+active_requests = 0
+maintenance_changed: asyncio.Event | None = None
 reminder_wakeup: asyncio.Event | None = None
 DIET_TRAINING = "training"
 DIET_REST = "rest"
 WEEKDAY_LABELS = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд")
 
 
+def backup_key_ready() -> bool:
+    return len(backup_encryption_key) >= 32 and not backup_encryption_key.lower().startswith(("replace-with-", "change_me"))
+
+
 class WhitelistMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
+        global active_requests
+        user = getattr(event, "from_user", None)
+        restore_confirm = isinstance(event, CallbackQuery) and event.data == "backup:restore-confirm"
+        if maintenance_mode and not restore_confirm:
+            if isinstance(event, CallbackQuery):
+                await event.answer("Бот тимчасово відновлює базу. Спробуйте за хвилину.", show_alert=True)
+            elif isinstance(event, Message):
+                await event.answer("Бот тимчасово відновлює базу. Спробуйте за хвилину.")
+            return None
+        active_requests += 1
+        try:
+            return await self._handle(handler, event, data)
+        finally:
+            active_requests -= 1
+            if maintenance_changed:
+                maintenance_changed.set()
+
+    async def _handle(self, handler, event, data):
         user = getattr(event, "from_user", None)
         if user is None:
             return await handler(event, data)
@@ -91,6 +120,9 @@ class InputFlow(StatesGroup):
     import_workout = State()
     manual_activity = State()
     daily_summary_time = State()
+    backup_schedule = State()
+    backup_restore_upload = State()
+    backup_restore_confirm = State()
 
 
 def buttons(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
@@ -537,8 +569,6 @@ async def more_markup(user_id: int) -> InlineKeyboardMarkup:
         [('📤 Експорт моїх даних', 'export')],
         [('ℹ️ Допомога', 'help')],
     ]
-    if await is_admin(user_id):
-        rows.insert(2, [('💾 Повна копія бази', 'backup')])
     rows.append([('← До спорту і раціону', 'sport:menu')])
     return buttons(rows)
 
@@ -817,10 +847,10 @@ async def cancel_callback(callback: CallbackQuery, state: FSMContext) -> None:
 async def backup_command(message: Message) -> None:
     if await access_denied(message):
         return
-    if not await is_admin(message.from_user.id):
-        await message.answer("Повна копія бази доступна лише адміністратору. Для особистих даних скористайтеся /export.")
+    if message.from_user.id != admin_id or message.chat.type != "private":
+        await message.answer("Керування повними копіями доступне лише власнику в особистому чаті.")
         return
-    await send_database_backup(message)
+    await show_backup_center(message)
 
 
 async def send_user_export(message: Message) -> None:
@@ -843,16 +873,54 @@ async def send_user_export(message: Message) -> None:
     )
 
 
-async def send_database_backup(message: Message) -> None:
-    payload = await db.sqlite_snapshot()
-    stamp = datetime.now(APP_TIMEZONE).strftime("%Y%m%d_%H%M")
-    archive = io.BytesIO()
-    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
-        bundle.writestr("fitness_bot.sqlite3", payload)
-    await message.answer_document(
-        BufferedInputFile(archive.getvalue(), filename=f"bot_database_{stamp}.zip"),
-        caption="💾 Повна копія бази даних бота. Містить дані всіх користувачів; зберігайте файл у приватному місці.",
+def backup_center_markup(schedule) -> InlineKeyboardMarkup:
+    return buttons([
+        [('💾 Створити копію зараз', 'backup:create')],
+        [('📅 Автоматично: щодня', 'backup:daily'), ('🗓 Щотижня', 'backup:weekly')],
+        [('📆 Щомісяця', 'backup:monthly'), ('🔕 Вимкнути розклад', 'backup:off')],
+        [('♻️ Відновити з файла', 'backup:restore')],
+        [('← До адмін-панелі', 'admin')],
+    ])
+
+
+async def backup_center_text() -> str:
+    schedule = await db.backup_schedule()
+    if schedule["frequency"] == "off":
+        status = "Автоматичні копії вимкнені."
+    else:
+        freq = {"daily": "щодня", "weekly": f"щотижня ({WEEKDAY_LABELS[schedule['weekday']]})", "monthly": f"щомісяця ({schedule['monthday']} числа)"}.get(schedule["frequency"], "вимкнені")
+        status = f"Розклад: {freq} о {schedule['send_time']} за Києвом."
+    last = schedule["last_success_at"]
+    if last:
+        status += f"\nОстання успішна копія: {last}."
+    if schedule["last_error"]:
+        status += "\n⚠️ Остання спроба завершилася помилкою; бот повторить її пізніше."
+    key_status = "налаштований" if backup_key_ready() else "не налаштований"
+    return (
+        "🗄 <b>Резервні копії</b>\n\n"
+        f"{status}\n\n"
+        "Архів містить повну SQLite-базу бота: профілі й доступи, продукти та раціони, активність і тренування, фінансові рахунки й операції, цілі з прогресом, звички з відмітками, щоденну й тижневу рефлексію та налаштування. "
+        "Копія шифрується перед надсиланням у Telegram.\n"
+        f"🔐 Ключ шифрування: {key_status}. Задайте <code>BACKUP_ENCRYPTION_KEY</code> у .env (від 32 символів) і збережіть його окремо."
     )
+
+
+async def show_backup_center(target: Message | CallbackQuery) -> None:
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(await backup_center_text(), reply_markup=backup_center_markup(None), parse_mode="HTML")
+    else:
+        await target.answer(await backup_center_text(), reply_markup=backup_center_markup(None), parse_mode="HTML")
+
+
+async def send_database_backup(target: Message, *, automatic: bool = False) -> None:
+    if not backup_key_ready():
+        raise BackupError("Налаштуйте BACKUP_ENCRYPTION_KEY у .env (від 32 символів), щоб створювати зашифровані копії.")
+    payload = await db.sqlite_snapshot()
+    now = datetime.now(APP_TIMEZONE)
+    archive = make_backup_archive(payload, backup_encryption_key, now)
+    stamp = now.strftime("%Y%m%d_%H%M")
+    caption = "🗄 Зашифрована повна копія бази. Для відновлення потрібен BACKUP_ENCRYPTION_KEY."
+    await target.answer_document(BufferedInputFile(archive, filename=f"fitness_bot_backup_{stamp}.fbackup"), caption=caption)
 
 
 @router.message(Command("export"))
@@ -999,7 +1067,7 @@ async def monthly_report_callback(callback: CallbackQuery) -> None:
 async def more_callback(callback: CallbackQuery) -> None:
     if await access_denied(callback):
         return
-    await callback.message.edit_text("⋯ <b>Інструменти</b>\n\nІмпорт даних, база продуктів, резервна копія та допомога.", reply_markup=await more_markup(callback.from_user.id), parse_mode="HTML")
+    await callback.message.edit_text("⋯ <b>Інструменти</b>\n\nІмпорт даних, база продуктів, особистий експорт і допомога.", reply_markup=await more_markup(callback.from_user.id), parse_mode="HTML")
     await callback.answer()
 
 
@@ -1012,7 +1080,7 @@ async def help_callback(callback: CallbackQuery) -> None:
         "🩺 <b>Здоровʼя</b> — активність і сон з Health Export Kit.\n"
         "📥 <b>Імпорт</b> — надішліть файл документом.\n"
         "📤 <b>Експорт</b> — архів ваших даних у CSV.\n"
-        "💾 <b>Резервна копія</b> — повний знімок бази для адміністратора.\n\n"
+        "🗄 <b>Резервні копії</b> — повна база бота для власника, у меню адмін-панелі.\n\n"
         "Одиниці «г/мл» рахуються на 100 одиниць, «шт» — на одну штуку.",
         reply_markup=more_nav(),
         parse_mode="HTML",
@@ -1027,8 +1095,193 @@ async def backup_callback(callback: CallbackQuery) -> None:
     if not await is_admin(callback.from_user.id):
         await callback.answer("Повна копія доступна лише адміністратору.", show_alert=True)
         return
-    await send_database_backup(callback.message)
-    await callback.answer("Резервну копію надіслано")
+    await callback.message.edit_text(await backup_center_text(), reply_markup=backup_center_markup(None), parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "backup:create")
+async def backup_create_callback(callback: CallbackQuery) -> None:
+    if await access_denied(callback):
+        return
+    if callback.from_user.id != admin_id or callback.message.chat.type != "private":
+        await callback.answer("Доступ лише власнику в особистому чаті.", show_alert=True)
+        return
+    try:
+        await send_database_backup(callback.message)
+    except BackupError as exc:
+        await callback.message.answer(str(exc))
+    await callback.answer("Копію підготовлено")
+
+
+@router.callback_query(F.data.in_({"backup:daily", "backup:weekly", "backup:monthly", "backup:off", "backup:restore", "backup:cancel"}))
+async def backup_action_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    if await access_denied(callback):
+        return
+    if callback.from_user.id != admin_id or callback.message.chat.type != "private":
+        await callback.answer("Доступ лише власнику в особистому чаті.", show_alert=True)
+        return
+    action = callback.data.split(":", 1)[1]
+    if action in {"daily", "weekly", "monthly"}:
+        if not backup_key_ready():
+            await callback.answer("Спочатку налаштуйте BACKUP_ENCRYPTION_KEY на сервері.", show_alert=True)
+            return
+        await state.set_state(InputFlow.backup_schedule)
+        await state.update_data(backup_frequency=action)
+        hint = {"daily": "Введіть час за Києвом у форматі ГГ:ХХ, наприклад 20:00.", "weekly": "Введіть день і час, наприклад Пн 20:00.", "monthly": "Введіть число місяця та час, наприклад 1 20:00."}[action]
+        await callback.message.edit_text(f"📅 <b>Розклад копій</b>\n\n{hint}", reply_markup=buttons([[('✖️ Скасувати', 'backup:cancel')]]), parse_mode="HTML")
+    elif action == "off":
+        await db.set_backup_schedule("off")
+        if reminder_wakeup:
+            reminder_wakeup.set()
+        await callback.message.edit_text(await backup_center_text(), reply_markup=backup_center_markup(None), parse_mode="HTML")
+    elif action == "restore":
+        await state.clear()
+        await state.set_state(InputFlow.backup_restore_upload)
+        await callback.message.edit_text("♻️ Надішліть файл резервної копії документом. Підтримуються зашифровані .fbackup та старі ZIP-копії.", reply_markup=buttons([[('✖️ Скасувати', 'backup:cancel')]]))
+    elif action == "cancel":
+        await state.clear()
+        await callback.message.edit_text(await backup_center_text(), reply_markup=backup_center_markup(None), parse_mode="HTML")
+    await callback.answer()
+
+
+@router.message(InputFlow.backup_schedule)
+async def backup_schedule_received(message: Message, state: FSMContext) -> None:
+    if message.from_user.id != admin_id or message.chat.type != "private":
+        await state.clear()
+        return
+    data = await state.get_data()
+    frequency = data.get("backup_frequency")
+    parts = (message.text or "").strip().split()
+    weekday = 0
+    monthday = 1
+    time_value = ""
+    try:
+        if frequency == "daily" and len(parts) == 1:
+            time_value = datetime.strptime(parts[0], "%H:%M").strftime("%H:%M")
+        elif frequency == "weekly" and len(parts) == 2:
+            weekday = WEEKDAY_LABELS.index(parts[0].capitalize())
+            time_value = datetime.strptime(parts[1], "%H:%M").strftime("%H:%M")
+        elif frequency == "monthly" and len(parts) == 2:
+            monthday = int(parts[0])
+            if not 1 <= monthday <= 31:
+                raise ValueError
+            time_value = datetime.strptime(parts[1], "%H:%M").strftime("%H:%M")
+        else:
+            raise ValueError
+    except ValueError:
+        await message.answer("Формат не розпізнано. Спробуйте ще раз або /cancel.")
+        return
+    schedule_info = {"frequency": frequency, "send_time": time_value, "weekday": weekday, "monthday": monthday}
+    baseline = scheduled_backup_occurrence(datetime.now(APP_TIMEZONE), schedule_info)
+    await db.set_backup_schedule(frequency, time_value, weekday, monthday, baseline)
+    if reminder_wakeup:
+        reminder_wakeup.set()
+    await state.clear()
+    await message.answer("✅ Розклад збережено. Копії надходитимуть у цей особистий чат.", reply_markup=backup_center_markup(None))
+
+
+@router.callback_query(F.data == "backup:restore-confirm")
+async def backup_restore_confirm(callback: CallbackQuery, state: FSMContext) -> None:
+    global maintenance_mode
+    if await access_denied(callback):
+        return
+    if callback.from_user.id != admin_id or callback.message.chat.type != "private":
+        await callback.answer("Доступ лише власнику в особистому чаті.", show_alert=True)
+        return
+    data = await state.get_data()
+    candidate = data.get("restore_database")
+    if not isinstance(candidate, bytes):
+        await callback.answer("Файл відновлення вже не доступний. Надішліть його знову.", show_alert=True)
+        return
+    database_path = Path(db.path)
+    temp_path: Path | None = None
+    safety_path: Path | None = None
+    maintenance_mode = True
+    try:
+        while active_requests > 1:
+            if maintenance_changed is None:
+                await asyncio.sleep(0.1)
+            else:
+                maintenance_changed.clear()
+                if active_requests > 1:
+                    await maintenance_changed.wait()
+        safety = await db.sqlite_snapshot()
+        database_path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=database_path.parent, suffix=".emergency.sqlite3", delete=False) as emergency:
+            emergency.write(safety)
+            safety_path = Path(emergency.name)
+        safety_path.chmod(0o600)
+        with tempfile.NamedTemporaryFile(dir=database_path.parent, suffix=".restore", delete=False) as staged:
+            staged.write(candidate)
+            temp_path = Path(staged.name)
+        temp_path.chmod(0o600)
+        await db.close()
+        os.replace(temp_path, database_path)
+        temp_path = None
+        await db.connect()
+        await db.configure_admin(admin_id)
+    except Exception:
+        logging.exception("Full database restore failed; restoring safety snapshot")
+        if safety_path is None:
+            await callback.message.answer("❌ Не вдалося створити аварійну копію. Відновлення не виконано, поточна база залишилася без змін.")
+            return
+        with suppress(Exception):
+            await db.close()
+        os.replace(safety_path, database_path)
+        safety_path = None
+        await db.connect()
+        await db.configure_admin(admin_id)
+        await callback.message.answer("❌ Не вдалося відновити файл. Поточні дані повернуто з аварійної копії.")
+    else:
+        await callback.message.answer("✅ Базу відновлено. Власника бота збережено.")
+        if safety_path:
+            safety_path.unlink(missing_ok=True)
+            safety_path = None
+    finally:
+        maintenance_mode = False
+        if temp_path:
+            temp_path.unlink(missing_ok=True)
+        await state.clear()
+    await callback.message.answer(await backup_center_text(), reply_markup=backup_center_markup(None), parse_mode="HTML")
+    await callback.answer()
+
+
+@router.message(InputFlow.backup_restore_upload, F.document)
+async def backup_restore_file_received(message: Message, state: FSMContext, bot: Bot) -> None:
+    if message.from_user.id != admin_id or message.chat.type != "private":
+        await state.clear()
+        return
+    document = message.document
+    if not document or (document.file_size and document.file_size > 20 * 1024 * 1024):
+        await message.answer("Файл завеликий або не розпізнаний. Максимум — 20 МБ.")
+        return
+    try:
+        remote = await bot.get_file(document.file_id)
+        stream = await bot.download_file(remote.file_path)
+        raw = stream.read()
+        database_bytes, details = read_backup_archive(raw, backup_encryption_key)
+    except BackupError as exc:
+        await message.answer(f"❌ {exc}")
+        return
+    except Exception:
+        logging.exception("Could not download/validate database backup")
+        await message.answer("❌ Не вдалося прочитати файл копії. Перевірте файл і спробуйте ще раз.")
+        return
+    await state.update_data(restore_database=database_bytes, restore_details=details)
+    await state.set_state(InputFlow.backup_restore_confirm)
+    created = details.get("created_at") or "дату не вказано (старий формат)"
+    warning = "\n⚠️ Старий архів не зашифрований." if details.get("legacy_unencrypted") else ""
+    counts = details.get("record_counts", {})
+    await message.answer(
+        f"🔎 <b>Копію перевірено</b>\n\nДата: {escape(str(created))}\nКористувачів: {details['users']} · профілів: {details['profiles']}\n"
+        f"Записів: раціон {counts.get('food_log', 0)}, активність {counts.get('activity_log', 0)}, фінанси {counts.get('finance_transactions', 0)}, "
+        f"цілі {counts.get('goals', 0)}, звички {counts.get('habits', 0)} / відміток {counts.get('habit_logs', 0)}, "
+        f"рефлексія {counts.get('reflection_entries', 0)} + тижневих підсумків {counts.get('weekly_reflections', 0)}, тренування {counts.get('training_sessions', 0)}.\n"
+        f"Таблиць: {details['tables']}\n\n"
+        f"⚠️ Підтвердження повністю замінить поточні дані бази.{warning}\nПеред цим бот створить аварійну копію поточного стану.",
+        reply_markup=buttons([[('♻️ Так, відновити', 'backup:restore-confirm')], [('✖️ Скасувати', 'backup:cancel')]]),
+        parse_mode="HTML",
+    )
 
 
 @router.callback_query(F.data == "export")
@@ -1058,9 +1311,10 @@ async def admin_callback(callback: CallbackQuery) -> None:
         return
     accounts = await db.accounts()
     markup = admin_markup(accounts)
-    markup.inline_keyboard.insert(0, [InlineKeyboardButton(text="📥 Імпорт FoodDatabase.md", callback_data="adm:foods_import")])
+    markup.inline_keyboard.insert(0, [InlineKeyboardButton(text="🗄 Резервні копії", callback_data="backup")])
+    markup.inline_keyboard.insert(1, [InlineKeyboardButton(text="📥 Імпорт FoodDatabase.md", callback_data="adm:foods_import")])
     await callback.message.edit_text(
-        "🛡 <b>Адмін-панель</b>\n\nКерування доступами, користувачами, їхніми фітнес-профілями та спільною базою продуктів. Оберіть користувача для дії:",
+        "🛡 <b>Адмін-панель</b>\n\nРезервні копії, доступи, користувачі, фітнес-профілі та спільна база продуктів. Оберіть дію або користувача:",
         reply_markup=markup,
         parse_mode="HTML",
     )
@@ -2178,7 +2432,8 @@ async def reminder_loop(bot: Bot) -> None:
     kyiv = APP_TIMEZONE
     last_checked_minute: str | None = None
     while True:
-        if await db.active_daily_summary_count() == 0 and await db.active_habit_reminder_count() == 0:
+        schedule = await db.backup_schedule()
+        if await db.active_daily_summary_count() == 0 and await db.active_habit_reminder_count() == 0 and schedule["frequency"] == "off":
             if reminder_wakeup is None:
                 await asyncio.sleep(3600)
             else:
@@ -2191,6 +2446,7 @@ async def reminder_loop(bot: Bot) -> None:
             last_checked_minute = minute_key
             local_date = now.date().isoformat()
             time_value = now.strftime("%H:%M")
+            await maybe_send_scheduled_backup(bot, now, schedule)
             try:
                 user_ids = await db.due_daily_summary_users(time_value, local_date)
             except Exception:
@@ -2233,9 +2489,65 @@ async def reminder_loop(bot: Bot) -> None:
         await asyncio.sleep(delay)
 
 
+def scheduled_backup_occurrence(now: datetime, schedule) -> str | None:
+    frequency = schedule["frequency"]
+    if frequency == "off":
+        return None
+    due_time = schedule["send_time"]
+    current_day = now.date()
+    if now.strftime("%H:%M") < due_time:
+        current_day -= timedelta(days=1)
+    if frequency == "daily":
+        due_day = current_day
+    elif frequency == "weekly":
+        due_day = current_day - timedelta(days=(current_day.weekday() - schedule["weekday"]) % 7)
+    elif frequency == "monthly":
+        due_day = current_day.replace(day=min(schedule["monthday"], calendar.monthrange(current_day.year, current_day.month)[1]))
+        if due_day > current_day:
+            previous_month = (current_day.replace(day=1) - timedelta(days=1))
+            due_day = previous_month.replace(day=min(schedule["monthday"], calendar.monthrange(previous_month.year, previous_month.month)[1]))
+    else:
+        return None
+    return f"{frequency}:{due_day.isoformat()}:{due_time}"
+
+
+async def maybe_send_scheduled_backup(bot: Bot, now: datetime, schedule) -> None:
+    global backup_encryption_key, active_requests
+    if maintenance_mode:
+        return
+    active_requests += 1
+    occurrence: str | None = None
+    try:
+        occurrence = scheduled_backup_occurrence(now, schedule)
+        if occurrence is None or not backup_key_ready():
+            return
+        if not await db.claim_backup_attempt(occurrence, now.isoformat(timespec="seconds")):
+            return
+        payload = await db.sqlite_snapshot()
+        archive = make_backup_archive(payload, backup_encryption_key, now)
+        stamp = now.strftime("%Y%m%d_%H%M")
+        await bot.send_document(
+            admin_id,
+            BufferedInputFile(archive, filename=f"fitness_bot_backup_{stamp}.fbackup"),
+            caption="🗄 Автоматична зашифрована копія повної бази. Для відновлення потрібен BACKUP_ENCRYPTION_KEY.",
+        )
+        await db.record_backup_result(True, occurrence)
+    except Exception as exc:
+        logging.exception("Automatic full database backup failed")
+        if occurrence is not None:
+            await db.record_backup_result(False, occurrence, str(exc))
+        with suppress(Exception):
+            await bot.send_message(admin_id, "⚠️ Не вдалося надіслати автоматичну резервну копію. Бот повторить спробу пізніше.")
+    finally:
+        active_requests -= 1
+        if maintenance_changed:
+            maintenance_changed.set()
+
+
 async def main() -> None:
-    global db, admin_id, reminder_wakeup
+    global db, admin_id, reminder_wakeup, backup_encryption_key, maintenance_changed
     settings = Settings.from_env()
+    backup_encryption_key = settings.backup_encryption_key
     setup_logging(settings.log_level)
     logger = logging.getLogger(__name__)
     db = Database(settings.database_path)
@@ -2251,6 +2563,7 @@ async def main() -> None:
         configure_training(db)
         bot = Bot(settings.bot_token)
         reminder_wakeup = asyncio.Event()
+        maintenance_changed = asyncio.Event()
         configure_goals(db, reminder_wakeup)
         reminder_task = asyncio.create_task(reminder_loop(bot), name="daily-summary-reminders")
         dispatcher = Dispatcher()

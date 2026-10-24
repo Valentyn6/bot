@@ -17,6 +17,7 @@ class Settings:
     database_path: str
     admin_telegram_id: int | None = None
     log_level: str = "INFO"
+    backup_encryption_key: str = ""
 
     def __post_init__(self) -> None:
         token = self.bot_token.strip()
@@ -46,4 +47,5 @@ class Settings:
             str(database_path),
             parsed_admin_id,
             os.getenv("LOG_LEVEL", "INFO"),
+            os.getenv("BACKUP_ENCRYPTION_KEY", "").strip(),
         )

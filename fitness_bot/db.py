@@ -37,6 +37,19 @@ CREATE TABLE IF NOT EXISTS user_preferences (
     last_daily_summary_date TEXT,
     FOREIGN KEY(telegram_id) REFERENCES telegram_accounts(telegram_id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS bot_backup_settings (
+    id INTEGER PRIMARY KEY CHECK(id = 1),
+    frequency TEXT NOT NULL DEFAULT 'off',
+    send_time TEXT NOT NULL DEFAULT '20:00',
+    weekday INTEGER NOT NULL DEFAULT 0,
+    monthday INTEGER NOT NULL DEFAULT 1,
+    last_attempt_key TEXT,
+    last_success_key TEXT,
+    last_attempt_at TEXT,
+    last_success_at TEXT,
+    last_error TEXT
+);
+INSERT OR IGNORE INTO bot_backup_settings(id) VALUES (1);
 CREATE TABLE IF NOT EXISTS profiles (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     owner_telegram_id INTEGER NOT NULL,
@@ -347,6 +360,9 @@ class Database:
         self.conn = await aiosqlite.connect(self.path)
         self.conn.row_factory = aiosqlite.Row
         await self.conn.executescript(SCHEMA)
+        backup_columns = {row[1] for row in await (await self._db().execute("PRAGMA table_info(bot_backup_settings)")).fetchall()}
+        if "last_success_key" not in backup_columns:
+            await self._db().execute("ALTER TABLE bot_backup_settings ADD COLUMN last_success_key TEXT")
         await self._migrate_accounts()
         await self._migrate_activity_log()
         await self._migrate_food_log()
@@ -1332,6 +1348,42 @@ class Database:
             "SELECT COUNT(*) AS count FROM user_preferences WHERE daily_summary_time IS NOT NULL",
         )).fetchone()
         return int(row["count"])
+
+    async def backup_schedule(self):
+        row = await (await self._db().execute("SELECT * FROM bot_backup_settings WHERE id=1")).fetchone()
+        return row
+
+    async def set_backup_schedule(self, frequency: str, send_time: str = "20:00", weekday: int = 0, monthday: int = 1, baseline_key: str | None = None) -> None:
+        if frequency not in {"off", "daily", "weekly", "monthly"}:
+            raise ValueError("Unsupported backup frequency")
+        await self._db().execute(
+            "UPDATE bot_backup_settings SET frequency=?, send_time=?, weekday=?, monthday=?, last_attempt_key=?, last_success_key=?, last_attempt_at=?, last_error=NULL WHERE id=1",
+            (frequency, send_time, weekday, monthday, baseline_key, baseline_key, datetime.now().astimezone().isoformat(timespec="seconds") if baseline_key else None),
+        )
+        await self._db().commit()
+
+    async def claim_backup_attempt(self, occurrence_key: str, now_iso: str) -> bool:
+        db = self._db()
+        row = await (await db.execute("SELECT last_attempt_key, last_attempt_at, last_success_key FROM bot_backup_settings WHERE id=1")).fetchone()
+        if row and row["last_success_key"] == occurrence_key:
+            return False
+        if row and row["last_attempt_key"] == occurrence_key and row["last_attempt_at"]:
+            try:
+                attempted = datetime.fromisoformat(row["last_attempt_at"])
+                if (datetime.fromisoformat(now_iso) - attempted).total_seconds() < 3600:
+                    return False
+            except ValueError:
+                pass
+        await db.execute("UPDATE bot_backup_settings SET last_attempt_key=?, last_attempt_at=?, last_error=NULL WHERE id=1", (occurrence_key, now_iso))
+        await db.commit()
+        return True
+
+    async def record_backup_result(self, success: bool, occurrence_key: str, error: str | None = None) -> None:
+        if success:
+            await self._db().execute("UPDATE bot_backup_settings SET last_success_key=?, last_success_at=?, last_error=NULL WHERE id=1", (occurrence_key, datetime.now().astimezone().isoformat(timespec="seconds")))
+        else:
+            await self._db().execute("UPDATE bot_backup_settings SET last_error=? WHERE id=1", ((error or "Помилка відправлення")[:500],))
+        await self._db().commit()
 
     async def claim_daily_summary(self, telegram_id: int, time_value: str, local_date: str) -> bool:
         cursor = await self._db().execute(
