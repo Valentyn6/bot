@@ -261,6 +261,7 @@ async def home_markup(user_id: int) -> InlineKeyboardMarkup:
 async def sport_markup(user_id: int) -> InlineKeyboardMarkup:
     rows = [
         [('🍽 Раціон', 'food'), ('⚖️ Вага', 'weight')],
+        [('🛒 Список покупок на тиждень', 'shopping:list')],
         [('📊 Підсумки', 'reports:menu')],
         [('🏋️ Тренувальна програма', 'training:menu')],
         [('📈 Графіки', 'charts'), ('🩺 Здоровʼя', 'health')],
@@ -610,6 +611,102 @@ async def food_screen(user_id: int, diet_type: str = DIET_REST) -> tuple[str, In
     diet_buttons.append([('🔁 Змінити раціон', 'food')])
     diet_buttons.append([('← До спорту і раціону', 'sport:menu')])
     return text, buttons(diet_buttons)
+
+
+async def shopping_list_screen(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    profile = await account_profile(user_id)
+    today = local_today()
+    week_days = [today + timedelta(days=offset) for offset in range(7)]
+    split_mode = profile["diet_mode"] == "split"
+    selected_weekdays = saved_training_weekdays(profile) if split_mode else []
+    auto_schedule_note = ""
+
+    if split_mode and selected_weekdays is None:
+        recent_since = today - timedelta(days=27)
+        session_dates = await db.training_session_dates(profile["id"], recent_since.isoformat())
+        recent_training_weekdays = {
+            date.fromisoformat(session_date).weekday()
+            for session_date in session_dates
+            if session_date < today.isoformat()
+        }
+        selected_weekdays = sorted(recent_training_weekdays)
+        auto_schedule_note = (
+            "\nАвтовизначення: розклад оцінено за тренуваннями за останні 4 тижні."
+            if selected_weekdays else
+            "\nАвтовизначення: за останні 4 тижні тренувань не знайдено, тому для прогнозу враховано звичайний раціон на всі дні."
+        )
+
+    training_count = sum(day.weekday() in set(selected_weekdays or []) for day in week_days) if split_mode else 0
+    rest_count = len(week_days) - training_count
+    needed = {DIET_REST: rest_count, DIET_TRAINING: training_count}
+    totals: dict[tuple[int, str], dict[str, object]] = {}
+    source_dates: dict[str, str] = {}
+    missing: list[str] = []
+
+    for diet_type, day_count in needed.items():
+        if not day_count:
+            continue
+        plan = await db.latest_food_plan_day(profile["id"], diet_type)
+        if not plan:
+            missing.append(diet_type)
+            continue
+        source_date, products = plan
+        source_dates[diet_type] = source_date
+        for product in products:
+            key = (product["product_id"], product["unit"])
+            if key not in totals:
+                totals[key] = {"name": product["name"], "unit": product["unit"], "quantity": 0.0}
+            totals[key]["quantity"] = float(totals[key]["quantity"]) + float(product["quantity"]) * day_count
+
+    start_text = today.strftime("%d.%m")
+    end_text = week_days[-1].strftime("%d.%m.%Y")
+    if missing:
+        diet_names = {DIET_TRAINING: "тренувальний", DIET_REST: "звичайний"}
+        need_text = ", ".join(diet_names[item] for item in missing)
+        rows = []
+        for diet_type in missing:
+            label = "тренувальний" if diet_type == DIET_TRAINING else "звичайний"
+            rows.append([(f"🍽 Заповнити {label} раціон", f"food:{diet_type}")])
+        rows.append([("← До спорту і раціону", "sport:menu")])
+        return (
+            f"🛒 <b>Список покупок · {start_text}–{end_text}</b>\n\n"
+            f"Не можу скласти повний список: ще немає записаного {need_text} раціону. "
+            "Додай продукти в цей раціон — тоді бот візьме останній заповнений день як шаблон.",
+            buttons(rows),
+        )
+
+    lines = [
+        f"🛒 <b>Список покупок · {start_text}–{end_text}</b>",
+        "",
+        f"На 7 днів: звичайних — {rest_count}, тренувальних — {training_count}.",
+        "",
+    ]
+    for diet_type, source_date in source_dates.items():
+        label = "тренувальний" if diet_type == DIET_TRAINING else "звичайний"
+        lines.append(f"Шаблон {label} раціону: {source_date}.")
+    lines.append(auto_schedule_note)
+    if totals:
+        lines.extend(["", "<b>Купити:</b>"])
+        for item in sorted(totals.values(), key=lambda entry: str(entry["name"]).casefold()):
+            quantity = float(item["quantity"])
+            quantity_text = f"{quantity:g}".replace(".", ",")
+            lines.append(f"• {escape(str(item['name']))} — {quantity_text} {escape(str(item['unit']))}")
+    else:
+        lines.extend(["", "У вибраних раціонах поки немає продуктів."])
+
+    return "\n".join(line for line in lines if line is not None), buttons([
+        [("🔄 Оновити список", "shopping:list")],
+        [("← До спорту і раціону", "sport:menu")],
+    ])
+
+
+@router.callback_query(F.data == "shopping:list")
+async def shopping_list_callback(callback: CallbackQuery) -> None:
+    if await access_denied(callback):
+        return
+    text, markup = await shopping_list_screen(callback.from_user.id)
+    await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("food_repeat_menu:"))

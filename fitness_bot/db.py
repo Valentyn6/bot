@@ -711,6 +711,32 @@ class Database:
     async def food_day(self, profile_id: int, log_date: str, diet_type: str = "rest") -> list[aiosqlite.Row]:
         return await (await self._db().execute("SELECT l.*, f.name, f.protein, f.fat, f.carbs, f.calories, f.unit FROM food_log l JOIN food_database f ON f.id=l.product_id WHERE l.profile_id=? AND l.log_date=? AND l.diet_type=? ORDER BY l.id", (profile_id, log_date, diet_type))).fetchall()
 
+    async def latest_food_plan_day(self, profile_id: int, diet_type: str) -> tuple[str, list[aiosqlite.Row]] | None:
+        """Return aggregated products from the latest logged day for one diet type."""
+        db = self._db()
+        row = await (await db.execute(
+            "SELECT MAX(log_date) AS log_date FROM food_log WHERE profile_id=? AND diet_type=? AND log_date<=?",
+            (profile_id, diet_type, local_today().isoformat()),
+        )).fetchone()
+        if not row or not row["log_date"]:
+            return None
+        log_date = row["log_date"]
+        products = await (await db.execute(
+            "SELECT f.id AS product_id, f.name, f.unit, SUM(l.quantity) AS quantity "
+            "FROM food_log l JOIN food_database f ON f.id=l.product_id "
+            "WHERE l.profile_id=? AND l.diet_type=? AND l.log_date=? "
+            "GROUP BY f.id, f.name, f.unit ORDER BY f.name COLLATE NOCASE",
+            (profile_id, diet_type, log_date),
+        )).fetchall()
+        return log_date, products
+
+    async def training_session_dates(self, profile_id: int, since_date: str) -> list[str]:
+        rows = await (await self._db().execute(
+            "SELECT DISTINCT session_date FROM training_sessions WHERE profile_id=? AND session_date>=? ORDER BY session_date",
+            (profile_id, since_date),
+        )).fetchall()
+        return [row["session_date"] for row in rows]
+
     async def food_period(self, profile_id: int, start_date: str, end_date: str) -> list[aiosqlite.Row]:
         return await (await self._db().execute(
             "SELECT l.*, f.name, f.protein, f.fat, f.carbs, f.calories, f.unit "
