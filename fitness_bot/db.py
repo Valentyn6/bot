@@ -115,6 +115,14 @@ CREATE TABLE IF NOT EXISTS weight_log (
     PRIMARY KEY(profile_id, log_date),
     FOREIGN KEY(profile_id) REFERENCES profiles(id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS height_log (
+    profile_id INTEGER NOT NULL,
+    log_date TEXT NOT NULL,
+    height REAL NOT NULL,
+    source TEXT NOT NULL DEFAULT 'import',
+    PRIMARY KEY(profile_id, log_date),
+    FOREIGN KEY(profile_id) REFERENCES profiles(id) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS activity_log (
     profile_id INTEGER NOT NULL,
     log_date TEXT NOT NULL,
@@ -818,6 +826,13 @@ class Database:
     async def upsert_weight(self, profile_id: int, log_date: str, weight: float, source: str = "manual") -> None:
         await self._db().execute("INSERT INTO weight_log(profile_id, log_date, weight, source) VALUES (?, ?, ?, ?) ON CONFLICT(profile_id, log_date) DO UPDATE SET weight=excluded.weight, source=excluded.source", (profile_id, log_date, weight, source))
         await self._db().commit()
+
+    async def upsert_height(self, profile_id: int, log_date: str, height: float, source: str = "import") -> None:
+        await self._db().execute("INSERT INTO height_log(profile_id, log_date, height, source) VALUES (?, ?, ?, ?) ON CONFLICT(profile_id, log_date) DO UPDATE SET height=excluded.height, source=excluded.source", (profile_id, log_date, height, source))
+        await self._db().commit()
+
+    async def heights(self, profile_id: int) -> list[aiosqlite.Row]:
+        return await (await self._db().execute("SELECT * FROM height_log WHERE profile_id=? ORDER BY log_date", (profile_id,))).fetchall()
 
     async def weights(self, profile_id: int) -> list[aiosqlite.Row]:
         return await (await self._db().execute("SELECT * FROM weight_log WHERE profile_id=? ORDER BY log_date", (profile_id,))).fetchall()

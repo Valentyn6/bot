@@ -1519,7 +1519,21 @@ async def profile_callback(callback: CallbackQuery) -> None:
         f"🍽 Раціони: <b>{diet_mode}</b>\n"
         f"📊 Джерело даних: {'ручне' if profile['manual_mode'] else 'Health Export'}"
     )
-    rows = [[('🎯 Набір', 'mode:набір'), ('⚖️ Підтримання', 'mode:підтримання'), ('🔥 Схуднення', 'mode:схуднення')], [('🔁 ' + manual, 'toggle_manual')], [('✏️ Зріст', 'edit:height'), ('✏️ Вік', 'edit:age'), ('✏️ Стать', 'edit:sex')], [('✏️ Цільова вага', 'edit:target_weight')], [('✏️ Ручна вага', 'edit:manual_weight'), ('✏️ Ручна активність', 'edit:manual_activity')], [('✏️ Білок/кг', 'edit:protein_per_kg'), ('✏️ Жири/кг', 'edit:fat_per_kg')], [('✏️ Профіцит/дефіцит', 'edit:surplus_deficit')]]
+    rows = [
+        [('🎯 Набір', 'mode:набір'), ('⚖️ Підтримання', 'mode:підтримання'), ('🔥 Схуднення', 'mode:схуднення')],
+        [('🔁 ' + manual, 'toggle_manual')],
+    ]
+    if profile["manual_mode"]:
+        rows.append([('✏️ Зріст', 'edit:height'), ('✏️ Вік', 'edit:age'), ('✏️ Стать', 'edit:sex')])
+    else:
+        rows.append([('✍️ Зріст · вручну', 'edit:height'), ('✍️ Вік · вручну', 'edit:age'), ('✍️ Стать · вручну', 'edit:sex')])
+    rows.append([('✏️ Цільова вага', 'edit:target_weight')])
+    if profile["manual_mode"]:
+        rows.append([('✏️ Ручна вага', 'edit:manual_weight'), ('✏️ Ручна активність', 'edit:manual_activity')])
+    rows.extend([
+        [('✏️ Білок/кг', 'edit:protein_per_kg'), ('✏️ Жири/кг', 'edit:fat_per_kg')],
+        [('✏️ Профіцит/дефіцит', 'edit:surplus_deficit')],
+    ])
     if profile["diet_mode"] == "split":
         selected = saved_training_weekdays(profile)
         if selected is None:
@@ -1601,18 +1615,48 @@ async def mode_callback(callback: CallbackQuery) -> None:
 @router.callback_query(F.data == "toggle_manual")
 async def toggle_manual(callback: CallbackQuery) -> None:
     profile = await account_profile(callback.from_user.id)
-    await db.update_profile(profile["id"], manual_mode=0 if profile["manual_mode"] else 1)
+    updates = {"manual_mode": 0 if profile["manual_mode"] else 1}
+    if profile["manual_mode"]:
+        heights = await db.heights(profile["id"])
+        if heights:
+            updates["height"] = heights[-1]["height"]
+    await db.update_profile(profile["id"], **updates)
     await profile_callback(callback)
 
 
 @router.callback_query(F.data.startswith("edit:"))
 async def edit_profile(callback: CallbackQuery, state: FSMContext) -> None:
     field = callback.data.split(":", 1)[1]
+    if field == "sex":
+        profile = await account_profile(callback.from_user.id)
+        await callback.message.edit_text(
+            "Оберіть стать:",
+            reply_markup=buttons([
+                [(('✅ ' if profile["sex"] == "чоловіча" else '') + 'Чоловіча', 'sex:чоловіча')],
+                [(('✅ ' if profile["sex"] == "жіноча" else '') + 'Жіноча', 'sex:жіноча')],
+                [('← До профілю', 'profile')],
+            ]),
+        )
+        await callback.answer()
+        return
     prompts = {"height": "Введіть зріст (100–250 см):", "age": "Введіть вік (10–120):", "sex": "Введіть стать: чоловіча або жіноча.", "target_weight": "Введіть цільову вагу (20–300 кг):", "manual_weight": "Введіть ручну вагу (20–300 кг):", "manual_activity": "Введіть ручну активність у ккал (0 або більше):", "protein_per_kg": "Введіть білок у г/кг (0 або більше):", "fat_per_kg": "Введіть жири у г/кг (0 або більше):", "surplus_deficit": "Введіть робочий профіцит/дефіцит у ккал (0 або більше):"}
     await state.set_state(InputFlow.profile_value)
     await state.update_data(field=field)
     await callback.message.edit_text(prompts[field], reply_markup=nav())
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("sex:"))
+async def select_profile_sex(callback: CallbackQuery) -> None:
+    if await access_denied(callback):
+        return
+    sex = callback.data.split(":", 1)[1]
+    if sex not in {"чоловіча", "жіноча"}:
+        await callback.answer("Невідоме значення статі.", show_alert=True)
+        return
+    profile = await account_profile(callback.from_user.id)
+    await db.update_profile(profile["id"], sex=sex)
+    await profile_callback(callback)
 
 
 @router.message(InputFlow.profile_value)
@@ -2301,11 +2345,18 @@ async def document_handler(message: Message, state: FSMContext, bot: Bot) -> Non
         await db.upsert_activity(profile["id"], item)
     for item in parsed["weights"]:
         await db.upsert_weight(profile["id"], item["log_date"], item["weight"], "import")
+    for item in parsed["heights"]:
+        await db.upsert_height(profile["id"], item["log_date"], item["height"], "import")
+    if parsed["heights"] and not profile["manual_mode"]:
+        latest_height = max(parsed["heights"], key=lambda item: item["log_date"])
+        known_heights = await db.heights(profile["id"])
+        if not known_heights or latest_height["log_date"] >= known_heights[-1]["log_date"]:
+            await db.update_profile(profile["id"], height=latest_height["height"])
     for item in parsed["sleeps"]:
         await db.upsert_sleep(profile["id"], item)
     imported_dates = sorted({
         item["log_date"]
-        for kind in ("activities", "weights", "sleeps")
+        for kind in ("activities", "weights", "heights", "sleeps")
         for item in parsed[kind]
     })
     date_range = (
@@ -2318,6 +2369,7 @@ async def document_handler(message: Message, state: FSMContext, bot: Bot) -> Non
         f"📅 Діапазон даних: {date_range}\n"
         f"🏃 Днів активності: {len(parsed['activities'])}\n"
         f"⚖️ Записів ваги: {len(parsed['weights'])}\n"
+        f"📏 Записів зросту: {len(parsed['heights'])}\n"
         f"😴 Зведень сну: {len(parsed['sleeps'])}\n\n"
         "За дні, які вже були в базі, значення активності та тривалості сну об’єднані через максимум."
     )

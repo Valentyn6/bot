@@ -143,10 +143,15 @@ def parse_health_export(raw: bytes) -> dict[str, list[dict[str, Any]]]:
             "workout_count": float(item.get("workoutCount") or 0),
         })
     weights = []
+    heights = []
     for item in body or []:
         values = item.get("values") or {}
         if item.get("date") and values.get("bodyMass") is not None:
             weights.append({"log_date": _date(item["date"]), "weight": float(values["bodyMass"])})
+        if item.get("date") and values.get("height") is not None:
+            height = float(values["height"])
+            if math.isfinite(height) and 100 <= height <= 250:
+                heights.append({"log_date": _date(item["date"]), "height": height})
     sleeps: dict[str, dict[str, Any]] = {}
     for item in sleep or []:
         if not item.get("start"):
@@ -157,4 +162,4 @@ def parse_health_export(raw: bytes) -> dict[str, list[dict[str, Any]]]:
         current["asleep_sec"] += float(item.get("asleepSec") or 0)
         current["awake_sec"] += float(item.get("awakeSec") or 0)
         current["duration_sec"] += float(item.get("durationSec") or 0)
-    return {"activities": activities, "weights": weights, "sleeps": list(sleeps.values())}
+    return {"activities": activities, "weights": weights, "heights": heights, "sleeps": list(sleeps.values())}
