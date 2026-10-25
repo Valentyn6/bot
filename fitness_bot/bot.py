@@ -1760,16 +1760,30 @@ def advice_candidate(row, remaining: dict[str, float], familiar: bool):
         if added["calories"] <= 0 or added["calories"] > calorie_budget:
             continue
         coverage = {
-            nutrient: min(1.0, added[nutrient] / max(remaining[nutrient], 1))
+            nutrient: (
+                min(1.0, added[nutrient] / max(remaining[nutrient], 1))
+                if remaining[nutrient] > 0
+                else 0.0
+            )
             for nutrient in ("protein", "carbs", "fat", "calories")
         }
         overshoot = max(0.0, added["calories"] - remaining["calories"]) / max(remaining["calories"], 1)
+        macro_weights = {"protein": 0.35, "carbs": 0.25, "fat": 0.10}
+        macro_penalty = 0.0
+        for nutrient, weight in macro_weights.items():
+            if remaining[nutrient] <= 0:
+                # Do not reward adding a nutrient whose target has already been met.
+                macro_penalty += weight * min(1.0, added[nutrient] / 10) * 0.5
+            elif added[nutrient] > remaining[nutrient]:
+                excess_ratio = (added[nutrient] - remaining[nutrient]) / max(remaining[nutrient], 5)
+                macro_penalty += weight * min(1.0, excess_ratio) * 0.35
         score = (
             coverage["protein"] * 0.35
             + coverage["carbs"] * 0.25
             + coverage["fat"] * 0.10
             + coverage["calories"] * 0.30
             - overshoot * 1.5
+            - macro_penalty
             + (0.03 if familiar else 0)
         )
         if best is None or score > best[0]:
@@ -1801,7 +1815,10 @@ async def food_advice(callback: CallbackQuery) -> None:
         current_total = total_activity(current)
         previous_total = total_activity(previous)
         difference = round(current_total - previous_total)
-        activity_note = f"\nАктивність: {current_total:.0f} ккал проти {previous_total:.0f} ккал минулого тижня ({difference:+d})."
+        activity_note = (
+            f"\nАктивні калорії: сьогодні {current_total:.0f} ккал · "
+            f"того самого дня минулого тижня {previous_total:.0f} ккал ({difference:+d})."
+        )
 
     current_product_ids = {row["product_id"] for row in food_rows}
     catalog = await db.foods(await db.food_owner(callback.from_user.id))
