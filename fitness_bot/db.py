@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS telegram_accounts (
     access_status TEXT NOT NULL DEFAULT 'pending',
     is_admin INTEGER NOT NULL DEFAULT 0,
     can_manage_diet INTEGER NOT NULL DEFAULT 0,
+    setup_completed INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS user_preferences (
@@ -237,6 +238,7 @@ CREATE TABLE IF NOT EXISTS finance_transactions (
     mcc INTEGER,
     category_id INTEGER,
     goal_id INTEGER,
+    is_internal_transfer INTEGER NOT NULL DEFAULT 0,
     source TEXT NOT NULL DEFAULT 'manual',
     occurred_at TEXT NOT NULL,
     created_at TEXT NOT NULL,
@@ -402,6 +404,7 @@ class Database:
 
     async def _migrate_accounts(self) -> None:
         columns = {row[1] for row in await (await self._db().execute("PRAGMA table_info(telegram_accounts)")).fetchall()}
+        adding_setup_status = "setup_completed" not in columns
         migrations = {
             "username": "TEXT",
             "first_name": "TEXT",
@@ -410,10 +413,13 @@ class Database:
             "access_status": "TEXT NOT NULL DEFAULT 'approved'",
             "is_admin": "INTEGER NOT NULL DEFAULT 0",
             "can_manage_diet": "INTEGER NOT NULL DEFAULT 0",
+            "setup_completed": "INTEGER NOT NULL DEFAULT 1",
         }
         for column, definition in migrations.items():
             if column not in columns:
                 await self._db().execute(f"ALTER TABLE telegram_accounts ADD COLUMN {column} {definition}")
+        if adding_setup_status:
+            await self._db().execute("UPDATE telegram_accounts SET setup_completed=0 WHERE access_status IN ('pending', 'rejected') AND is_admin=0")
 
 
     async def _migrate_activity_log(self) -> None:
@@ -523,6 +529,12 @@ class Database:
             await self._db().execute("ALTER TABLE finance_transactions ADD COLUMN finance_account_id INTEGER")
         if "goal_id" not in columns:
             await self._db().execute("ALTER TABLE finance_transactions ADD COLUMN goal_id INTEGER REFERENCES goals(id) ON DELETE SET NULL")
+        if "is_internal_transfer" not in columns:
+            await self._db().execute("ALTER TABLE finance_transactions ADD COLUMN is_internal_transfer INTEGER NOT NULL DEFAULT 0")
+        await self._db().execute(
+            "UPDATE finance_transactions SET is_internal_transfer=1, category_id=NULL "
+            "WHERE source='monobank' AND LOWER(description) LIKE '%міграції рахунку%'"
+        )
         await self._db().execute("CREATE INDEX IF NOT EXISTS idx_finance_transactions_goal ON finance_transactions(goal_id)")
 
     async def _migrate_finance_auto_rules(self) -> None:
@@ -560,7 +572,7 @@ class Database:
             return row, False
         now = datetime.now().isoformat(timespec="seconds")
         await db.execute(
-            "INSERT INTO telegram_accounts(telegram_id, access_status, is_admin, can_manage_diet, created_at) VALUES (?, 'pending', 0, 0, ?)",
+            "INSERT INTO telegram_accounts(telegram_id, access_status, is_admin, can_manage_diet, setup_completed, created_at) VALUES (?, 'pending', 0, 0, 0, ?)",
             (telegram_id, now),
         )
         await db.commit()
@@ -581,6 +593,12 @@ class Database:
 
     async def set_access(self, telegram_id: int, status: str) -> None:
         await self._db().execute("UPDATE telegram_accounts SET access_status=?, can_manage_diet=0 WHERE telegram_id=?", (status, telegram_id))
+        await self._db().commit()
+
+    async def set_setup_completed(self, telegram_id: int) -> None:
+        db = self._db()
+        await db.execute("UPDATE telegram_accounts SET setup_completed=1 WHERE telegram_id=?", (telegram_id,))
+        await db.commit()
         await self._db().commit()
 
     async def set_diet_permission(self, telegram_id: int, allowed: bool) -> None:
@@ -1123,9 +1141,9 @@ class Database:
         db = self._db()
         try:
             cur = await db.execute(
-                "INSERT INTO finance_transactions(telegram_id, monobank_account_id, mono_transaction_id, finance_account_id, amount_minor, currency_code, description, account_label, mcc, category_id, goal_id, source, occurred_at, created_at) "
-                "VALUES (:telegram_id, :monobank_account_id, :mono_transaction_id, :finance_account_id, :amount_minor, :currency_code, :description, :account_label, :mcc, :category_id, :goal_id, :source, :occurred_at, :created_at)",
-                {"telegram_id": telegram_id, "monobank_account_id": None, "mono_transaction_id": None, "finance_account_id": None, "currency_code": 980, "description": "", "account_label": "Monobank", "mcc": None, "category_id": None, "goal_id": None, "source": "manual", "occurred_at": datetime.now().isoformat(timespec="seconds"), "created_at": datetime.now().isoformat(timespec="seconds"), **values},
+                "INSERT INTO finance_transactions(telegram_id, monobank_account_id, mono_transaction_id, finance_account_id, amount_minor, currency_code, description, account_label, mcc, category_id, goal_id, is_internal_transfer, source, occurred_at, created_at) "
+                "VALUES (:telegram_id, :monobank_account_id, :mono_transaction_id, :finance_account_id, :amount_minor, :currency_code, :description, :account_label, :mcc, :category_id, :goal_id, :is_internal_transfer, :source, :occurred_at, :created_at)",
+                {"telegram_id": telegram_id, "monobank_account_id": None, "mono_transaction_id": None, "finance_account_id": None, "currency_code": 980, "description": "", "account_label": "Monobank", "mcc": None, "category_id": None, "goal_id": None, "is_internal_transfer": 0, "source": "manual", "occurred_at": datetime.now().isoformat(timespec="seconds"), "created_at": datetime.now().isoformat(timespec="seconds"), **values},
 
             )
             await db.commit()
@@ -1159,11 +1177,11 @@ class Database:
         start = (datetime.now() - timedelta(days=max(1, days))).isoformat(timespec="seconds")
         db = self._db()
         totals = await (await db.execute(
-            "SELECT COALESCE(SUM(CASE WHEN amount_minor > 0 THEN amount_minor ELSE 0 END), 0) AS income, COALESCE(SUM(CASE WHEN amount_minor < 0 THEN -amount_minor ELSE 0 END), 0) AS expenses FROM finance_transactions WHERE telegram_id=? AND occurred_at>=?",
+            "SELECT COALESCE(SUM(CASE WHEN amount_minor > 0 THEN amount_minor ELSE 0 END), 0) AS income, COALESCE(SUM(CASE WHEN amount_minor < 0 THEN -amount_minor ELSE 0 END), 0) AS expenses FROM finance_transactions WHERE telegram_id=? AND is_internal_transfer=0 AND occurred_at>=?",
             (telegram_id, start),
         )).fetchone()
         currency_totals = await (await db.execute(
-            "SELECT currency_code, COALESCE(SUM(CASE WHEN amount_minor > 0 THEN amount_minor ELSE 0 END), 0) AS income, COALESCE(SUM(CASE WHEN amount_minor < 0 THEN -amount_minor ELSE 0 END), 0) AS expenses FROM finance_transactions WHERE telegram_id=? AND occurred_at>=? GROUP BY currency_code ORDER BY currency_code",
+            "SELECT currency_code, COALESCE(SUM(CASE WHEN amount_minor > 0 THEN amount_minor ELSE 0 END), 0) AS income, COALESCE(SUM(CASE WHEN amount_minor < 0 THEN -amount_minor ELSE 0 END), 0) AS expenses FROM finance_transactions WHERE telegram_id=? AND is_internal_transfer=0 AND occurred_at>=? GROUP BY currency_code ORDER BY currency_code",
             (telegram_id, start),
         )).fetchall()
         categories = await (await db.execute(
@@ -1171,11 +1189,11 @@ class Database:
             "t.currency_code, SUM(-t.amount_minor) AS amount "
             "FROM finance_transactions t JOIN finance_categories c ON c.id=t.category_id "
             "LEFT JOIN finance_category_budget_groups g ON g.category_id=c.id AND g.telegram_id=t.telegram_id "
-            "WHERE t.telegram_id=? AND t.amount_minor<0 AND t.occurred_at>=? "
+            "WHERE t.telegram_id=? AND t.is_internal_transfer=0 AND t.amount_minor<0 AND t.occurred_at>=? "
             "GROUP BY c.id, c.name, COALESCE(g.budget_group, c.budget_group), t.currency_code ORDER BY amount DESC",
             (telegram_id, start),
         )).fetchall()
-        uncategorized = await (await db.execute("SELECT COUNT(*) AS count FROM finance_transactions WHERE telegram_id=? AND category_id IS NULL AND occurred_at>=?", (telegram_id, start))).fetchone()
+        uncategorized = await (await db.execute("SELECT COUNT(*) AS count FROM finance_transactions WHERE telegram_id=? AND is_internal_transfer=0 AND category_id IS NULL AND occurred_at>=?", (telegram_id, start))).fetchone()
         logger.debug(
             "Finance summary user=%s start=%s categories=%s uncategorized=%s",
             telegram_id,
@@ -1191,7 +1209,7 @@ class Database:
             "SELECT currency_code, "
             "COALESCE(SUM(CASE WHEN amount_minor > 0 THEN amount_minor ELSE 0 END), 0) AS income, "
             "COALESCE(SUM(CASE WHEN amount_minor < 0 THEN -amount_minor ELSE 0 END), 0) AS expenses "
-            "FROM finance_transactions WHERE telegram_id=? AND occurred_at>=? AND occurred_at<? "
+            "FROM finance_transactions WHERE telegram_id=? AND is_internal_transfer=0 AND occurred_at>=? AND occurred_at<? "
             "GROUP BY currency_code ORDER BY currency_code",
             (telegram_id, start, end),
         )).fetchall()
@@ -1201,11 +1219,11 @@ class Database:
         start = (now - timedelta(days=end_days)).isoformat(timespec="seconds")
         end = (now - timedelta(days=start_days)).isoformat(timespec="seconds")
         row = await (await self._db().execute(
-            "SELECT COALESCE(SUM(CASE WHEN amount_minor > 0 THEN amount_minor ELSE 0 END), 0) AS income, COALESCE(SUM(CASE WHEN amount_minor < 0 THEN -amount_minor ELSE 0 END), 0) AS expenses FROM finance_transactions WHERE telegram_id=? AND occurred_at>=? AND occurred_at<?",
+            "SELECT COALESCE(SUM(CASE WHEN amount_minor > 0 THEN amount_minor ELSE 0 END), 0) AS income, COALESCE(SUM(CASE WHEN amount_minor < 0 THEN -amount_minor ELSE 0 END), 0) AS expenses FROM finance_transactions WHERE telegram_id=? AND is_internal_transfer=0 AND occurred_at>=? AND occurred_at<?",
             (telegram_id, start, end),
         )).fetchone()
         currency_rows = await (await self._db().execute(
-            "SELECT currency_code, COALESCE(SUM(CASE WHEN amount_minor > 0 THEN amount_minor ELSE 0 END), 0) AS income, COALESCE(SUM(CASE WHEN amount_minor < 0 THEN -amount_minor ELSE 0 END), 0) AS expenses FROM finance_transactions WHERE telegram_id=? AND occurred_at>=? AND occurred_at<? GROUP BY currency_code ORDER BY currency_code",
+            "SELECT currency_code, COALESCE(SUM(CASE WHEN amount_minor > 0 THEN amount_minor ELSE 0 END), 0) AS income, COALESCE(SUM(CASE WHEN amount_minor < 0 THEN -amount_minor ELSE 0 END), 0) AS expenses FROM finance_transactions WHERE telegram_id=? AND is_internal_transfer=0 AND occurred_at>=? AND occurred_at<? GROUP BY currency_code ORDER BY currency_code",
             (telegram_id, start, end),
         )).fetchall()
         return {"income": int(row["income"]), "expenses": int(row["expenses"]), "currency_totals": currency_rows}

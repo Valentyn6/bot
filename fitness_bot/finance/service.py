@@ -10,6 +10,11 @@ from .monobank import MonobankClient, category_for_mcc, decrypt_token, encrypt_t
 logger = logging.getLogger(__name__)
 
 
+def is_internal_transfer(description: str) -> bool:
+    normalized = " ".join((description or "").casefold().split())
+    return "в рамках міграції рахунку" in normalized
+
+
 class FinanceService:
     def __init__(self, db: Database):
         self.db = db
@@ -149,9 +154,10 @@ class FinanceService:
             for item in await client.statement(account_id, days):
                 mcc = item.get("mcc")
                 description = item.get("description") or "Без опису"
+                internal_transfer = is_internal_transfer(description)
                 rule = await self.db.matching_finance_rule(telegram_id, description, mcc)
                 category_name = category_for_mcc(mcc)
-                category_id = rule["category_id"] if rule else category_ids.get(category_name)
+                category_id = None if internal_transfer else (rule["category_id"] if rule else category_ids.get(category_name))
                 saved = await self.db.add_finance_transaction(
                     telegram_id,
                     {
@@ -161,6 +167,7 @@ class FinanceService:
                         "amount_minor": int(item.get("amount", 0)),
                         "currency_code": int(item.get("currencyCode", 980)),
                          "description": description,
+                        "is_internal_transfer": int(internal_transfer),
                         "account_label": account_label,
                         "mcc": mcc,
                         "category_id": category_id,
@@ -207,7 +214,9 @@ class FinanceService:
             for row in account_rows
             if row["balance_minor"] is not None
         }
-        account_balances = {**cached_balances, **live_balances}
+        # If client-info is live, trust its account list as the complete current set.
+        # Cached account IDs may belong to cards closed during a bank migration.
+        account_balances = cached_balances if info.get("cached") else live_balances
         account_balances_by_currency: dict[int, int] = {}
         for amount, currency_code in account_balances.values():
             account_balances_by_currency[currency_code] = account_balances_by_currency.get(currency_code, 0) + amount

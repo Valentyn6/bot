@@ -39,6 +39,14 @@ def back_to_finance_keyboard() -> InlineKeyboardMarkup:
     return keyboard([[('← До фінансів', 'finance:menu')]])
 
 
+def monobank_guide_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔗 Відкрити кабінет API Monobank", url="https://api.monobank.ua/")],
+        [InlineKeyboardButton(text="🔑 Я вже маю токен", callback_data="finance:token:enter")],
+        [InlineKeyboardButton(text="← До фінансів", callback_data="finance:menu")],
+    ])
+
+
 def dashboard_menu(uncategorized: int = 0) -> InlineKeyboardMarkup:
     rows = [
         [("🔄 Синхронізувати Monobank", "finance:sync")],
@@ -201,7 +209,7 @@ def comparison_text(data: dict) -> str:
 
 def settings_menu() -> InlineKeyboardMarkup:
     return keyboard([
-        [("🔑 Змінити токен Monobank", "finance:settings:token")],
+        [("🔑 Налаштувати Monobank", "finance:bank:mono")],
         [("🏷 Назви карток", "finance:settings:accounts")],
         [("🏷 Категорії витрат", "finance:settings:categories")],
         [("📊 Вибрати пресет бюджету", "finance:settings:budget")],
@@ -231,9 +239,9 @@ async def finance_menu(callback: CallbackQuery) -> None:
     stored = await _db.monobank_account(callback.from_user.id)  # type: ignore[union-attr]
     if not stored:
         await callback.message.edit_text(
-            "💳 <b>Фінанси</b>\n\nMonobank ще не підключено. Підключіть рахунок, щоб бачити баланс і синхронізувати операції. Готівкові витрати можна записувати без підключення.",
+            "💳 <b>Фінанси</b>\n\nПідключіть Monobank для автоматичної синхронізації або записуйте витрати вручну.",
             reply_markup=keyboard([
-                [('🔑 Підключити Monobank', 'finance:settings:token')],
+                [('🔑 Підключити Monobank', 'finance:bank:mono')],
                 [('➕ Готівкова витрата', 'finance:cash')],
                 [('🔁 Повторити витрату', 'finance:repeat-cash')],
                 [('← Головне меню', 'home')],
@@ -248,6 +256,22 @@ async def finance_menu(callback: CallbackQuery) -> None:
         await callback.answer(f"Не вдалося завантажити dashboard: {exc}", show_alert=True)
         return
     await callback.message.edit_text(dashboard_text(data), reply_markup=dashboard_menu(data["summary"]["uncategorized"]), parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "finance:bank:mono")
+async def monobank_guide(callback: CallbackQuery) -> None:
+    if not await allowed(callback):
+        return
+    await callback.message.edit_text(
+        "🇺🇦 <b>Підключення Monobank</b>\n\n"
+        "1. Відкрийте особистий кабінет API Monobank і увійдіть.\n"
+        "2. Створіть персональний токен для доступу до інформації про рахунки та виписки.\n"
+        "3. Поверніться сюди й натисніть «Я вже маю токен», потім надішліть його боту.\n\n"
+        "Токен є секретним ключем: не надсилайте його в групи чи іншим людям. Після підключення бот перевірить його та завантажить операції.",
+        reply_markup=monobank_guide_keyboard(),
+        parse_mode="HTML",
+    )
     await callback.answer()
 
 
@@ -506,13 +530,13 @@ async def card_alias_received(message: Message, state: FSMContext) -> None:
     await message.answer("✅ Назву картки оновлено." if updated else "❌ Картку не знайдено.", reply_markup=settings_menu())
 
 
-@router.callback_query(F.data.in_({"finance:token", "finance:settings:token"}))
+@router.callback_query(F.data.in_({"finance:token", "finance:settings:token", "finance:token:enter"}))
 async def token_start(callback: CallbackQuery, state: FSMContext) -> None:
     if not await allowed(callback):
         return
     await state.clear()
     await state.set_state(FinanceTokenFlow.token)
-    await callback.message.edit_text("Надішліть токен Monobank одним повідомленням. Він не буде показаний у меню або логах.", reply_markup=cancel_keyboard())
+    await callback.message.edit_text("Надішліть персональний токен Monobank одним повідомленням. Після отримання бот спробує видалити повідомлення з токеном із чату та збереже ключ у зашифрованому вигляді.", reply_markup=cancel_keyboard())
     await callback.answer()
 
 
@@ -521,11 +545,16 @@ async def token_received(message: Message, state: FSMContext) -> None:
     if not await allowed(message):
         return
     try:
+        await message.delete()
+    except Exception:
+        pass
+    try:
         result = await service().save_token(message.from_user.id, message.text or "")
     except Exception as exc:
         await message.answer(f"❌ Не вдалося підключити Monobank: {escape(str(exc))}", reply_markup=cancel_keyboard())
         return
     await state.clear()
+    await _db.set_setup_completed(message.from_user.id)  # type: ignore[union-attr]
     await message.answer(f"✅ Monobank підключено для {escape(result['name'])}.\nПервинно завантажено операцій: {result['imported']}.", reply_markup=back_to_finance_keyboard())
 
 
@@ -607,20 +636,23 @@ async def transactions(callback: CallbackQuery) -> None:
         for index, row in enumerate(rows, 1):
             amount = int(row["amount_minor"])
             code = int(row["currency_code"] or 980)
-            kind = "Надходження" if amount >= 0 else "Витрата"
+            internal_transfer = bool(row_value(row, "is_internal_transfer", 0))
+            kind = "Внутрішній переказ" if internal_transfer else ("Надходження" if amount >= 0 else "Витрата")
             signed = "+" if amount >= 0 else "−"
             source = row["display_account_label"] if row["source"] == "monobank" else {"cash": "Готівка", "manual": "Ручна операція"}.get(row["source"], row["source"])
             description_text = " ".join((row["description"] or "Без опису").split())
             if len(description_text) > 90:
                 description_text = description_text[:87].rstrip() + "…"
             description = escape(description_text)
+            category = "↔ Внутрішній переказ" if internal_transfer else (row["category_name"] or "Без категорії")
             lines.append(
                 f"<b>{index}. {escape(kind)} · {signed}{money(abs(amount), code)}</b>\n"
                 f"   {row['occurred_at'][:10]} · {description}\n"
-                f"   {escape(str(source or 'Рахунок'))} · {escape(row['category_name'] or 'Без категорії')}"
+                f"   {escape(str(source or 'Рахунок'))} · {escape(str(category))}"
             )
         text = "\n".join(lines)
-    category_buttons = [[(f"🏷 №{index}", f"finance:category:{row['id']}") for index, row in enumerate(rows[start:start + 2], start + 1)] for start in range(0, len(rows), 2)]
+    category_rows = [(index, row) for index, row in enumerate(rows, 1) if not bool(row_value(row, "is_internal_transfer", 0))]
+    category_buttons = [[(f"🏷 №{index}", f"finance:category:{row['id']}") for index, row in category_rows[start:start + 2]] for start in range(0, len(category_rows), 2)]
     category_buttons.append([("← До фінансів", "finance:menu")])
     await callback.message.edit_text(text, reply_markup=keyboard(category_buttons), parse_mode="HTML")
     await callback.answer()
@@ -852,6 +884,7 @@ async def set_category(callback: CallbackQuery) -> None:
 async def cash_start(callback: CallbackQuery, state: FSMContext) -> None:
     if not await allowed(callback):
         return
+    await _db.set_setup_completed(callback.from_user.id)  # type: ignore[union-attr]
     await state.clear()
     await state.set_state(CashFlow.amount)
     await callback.message.edit_text("Введіть суму готівкової витрати у гривнях, наприклад: 250,50.", reply_markup=cancel_keyboard())

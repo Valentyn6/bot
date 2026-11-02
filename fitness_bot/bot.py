@@ -818,8 +818,28 @@ async def start(message: Message, state: FSMContext) -> None:
     profile = await db.active_profile(message.from_user.id)
     if not profile:
         await db.create_profile(message.from_user.id)
+        account = await db.account(message.from_user.id)
         await message.answer("Вітаю! Створено профіль «Я» з дефолтними значеннями. Їх можна змінити в 👤 Профіль.")
+    if not account["setup_completed"]:
+        await message.answer(
+            "👋 <b>Налаштуймо бота</b>\n\n"
+            "Профіль уже створено. Можеш одразу перейти до головного меню. Фінанси та інші розділи налаштовуються окремо, коли вони тобі знадобляться.",
+            reply_markup=buttons([
+                [("Відкрити головне меню", "setup:finish")],
+            ]),
+            parse_mode="HTML",
+        )
+        return
     await message.answer(main_text(), reply_markup=await home_markup(message.from_user.id), parse_mode="HTML")
+
+
+@router.callback_query(F.data == "setup:finish")
+async def finish_initial_setup(callback: CallbackQuery) -> None:
+    if await access_denied(callback):
+        return
+    await db.set_setup_completed(callback.from_user.id)
+    await callback.message.edit_text(main_text(), reply_markup=await home_markup(callback.from_user.id), parse_mode="HTML")
+    await callback.answer("Налаштування завершено")
 
 
 @router.message(Command("help"))
@@ -1423,7 +1443,7 @@ async def admin_action(callback: CallbackQuery) -> None:
     user_id = int(raw_user_id)
     if action == "approve":
         await db.set_access(user_id, "approved")
-        await callback.bot.send_message(user_id, "✅ Адміністратор схвалив вашу заявку. Тепер ви можете користуватися ботом.")
+        await callback.bot.send_message(user_id, "✅ Адміністратор схвалив вашу заявку. Надішліть /start, щоб налаштувати бота й перейти до меню.")
     elif action == "reject":
         await db.set_access(user_id, "rejected")
         await callback.bot.send_message(user_id, "❌ Адміністратор відхилив заявку. Ви можете повторити запит командою /start пізніше.")

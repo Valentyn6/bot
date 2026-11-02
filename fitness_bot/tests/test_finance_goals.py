@@ -326,6 +326,35 @@ def test_finance_dashboard_uses_negative_live_balance(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
+def test_account_migration_transactions_are_internal_after_database_migration(tmp_path):
+    async def scenario():
+        database = Database(str(tmp_path / "finance-migration.sqlite3"))
+        await database.connect()
+        await database.ensure_account(1)
+        category_id = next(row["id"] for row in await database.finance_categories(1) if "інше" in row["name"].casefold())
+        transaction_id = await database.add_finance_transaction(1, {
+            "amount_minor": -567501,
+            "description": "Списання коштів в рамках міграції рахунку",
+            "category_id": category_id,
+            "source": "monobank",
+            "occurred_at": "2999-01-01T10:00:00",
+        })
+        assert transaction_id is not None
+        await database._migrate_finance_transactions()
+        await database._db().commit()
+
+        transaction = (await database.finance_transactions(1, 1))[0]
+        summary = await database.finance_summary(1, 300000)
+        assert transaction["is_internal_transfer"] == 1
+        assert transaction["category_id"] is None
+        assert summary["income"] == 0
+        assert summary["expenses"] == 0
+        assert summary["categories"] == []
+        await database.close()
+
+    asyncio.run(scenario())
+
+
 def test_finance_dashboard_uses_cached_balances_when_monobank_fails(tmp_path, monkeypatch):
     async def scenario():
         database = Database(str(tmp_path / "finance-cache.sqlite3"))
