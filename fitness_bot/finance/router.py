@@ -141,7 +141,8 @@ def dashboard_text(data: dict) -> str:
     for code in sorted({int(row_value(row, "currency_code", 980)) for row in category_rows}):
         top = [row for row in category_rows if int(row_value(row, "currency_code", 980)) == code][:3]
         category_lines.extend(f"• {escape(row['name'])} — {money(row['amount'], code)}" for row in top)
-    categories = "\n".join(category_lines) if category_lines else "За останні 30 днів витрат ще немає."
+    period_label = data.get("period_label", "останні 30 днів")
+    categories = "\n".join(category_lines) if category_lines else f"За {period_label} витрат ще немає."
     jars = data.get("jars", [])
     jar_lines = []
     for jar in jars[:5]:
@@ -165,9 +166,9 @@ def dashboard_text(data: dict) -> str:
             f"  Надійшло {money(income, code)} · витрачено {money(expenses, code)}\n"
             f"  Різниця: <b>{'+' if net >= 0 else '−'}{money(abs(net), code)}</b>"
         )
-    flow_text = "\n".join(flow_lines) if flow_lines else "Операцій за останні 30 днів немає."
+    flow_text = "\n".join(flow_lines) if flow_lines else f"Операцій за {period_label} немає."
     return (
-        "💳 <b>Фінанси</b>\n<i>Операції за останні 30 днів</i>\n\n"
+        f"💳 <b>Фінанси</b>\n<i>Операції за {period_label}</i>\n\n"
         "💼 <b>Залишки зараз</b>\n" + balances_text + "\n\n"
         "📊 <b>Рух коштів</b>\n" + flow_text + "\n\n"
         "🧾 <b>Найбільші категорії витрат</b>\n" + categories + "\n\n"

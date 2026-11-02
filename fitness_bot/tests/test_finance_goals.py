@@ -37,7 +37,7 @@ def test_finance_dashboard_explains_period_budget_and_separates_currencies():
                 {"currency_code": 980, "income": 100_000, "expenses": 125_000},
             ],
             "categories": [
-                {"name": "🛒 Продукти", "amount": 60_000, "currency_code": 980},
+                {"name": "🛒 Продукти", "amount": 60_000, "currency_code": 980, "budget_group": "needs"},
                 {"name": "🎬 Розваги", "amount": 65_000, "currency_code": 980},
                 {"name": "Покупки", "amount": 10_000, "currency_code": 840},
             ],
@@ -48,11 +48,12 @@ def test_finance_dashboard_explains_period_budget_and_separates_currencies():
         "jar_balances_by_currency": {980: 100_000, 840: 10_000},
         "jars": [],
         "info": {},
+        "period_label": "поточний календарний місяць",
     }
 
     text = finance_dashboard_text(data)
 
-    assert "Операції за останні 30 днів" in text
+    assert "Операції за поточний календарний місяць" in text
     assert "USD · $" in text and "UAH · ₴" in text
     assert "Різниця: <b>−250.00 ₴</b>" in text
     assert "перевищено на 100.00 ₴" in text

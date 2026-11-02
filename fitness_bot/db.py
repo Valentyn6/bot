@@ -1184,27 +1184,36 @@ class Database:
             (transaction_id, telegram_id),
         )).fetchone()
 
-    async def finance_summary(self, telegram_id: int, days: int = 30) -> dict[str, Any]:
-        start = (datetime.now() - timedelta(days=max(1, days))).isoformat(timespec="seconds")
+    async def finance_summary(self, telegram_id: int, days: int = 30, calendar_month: bool = False) -> dict[str, Any]:
+        end: str | None = None
+        if calendar_month:
+            today = local_today()
+            month_start = date(today.year, today.month, 1)
+            next_month = date(today.year + (today.month == 12), 1 if today.month == 12 else today.month + 1, 1)
+            start, end = local_date_range_utc_naive(month_start.isoformat(), (next_month - timedelta(days=1)).isoformat())
+        else:
+            start = (datetime.now() - timedelta(days=max(1, days))).isoformat(timespec="seconds")
+        period_filter = "occurred_at>=?" + (" AND occurred_at<?" if end is not None else "")
+        period_params = (start, end) if end is not None else (start,)
         db = self._db()
         totals = await (await db.execute(
-            "SELECT COALESCE(SUM(CASE WHEN amount_minor > 0 THEN amount_minor ELSE 0 END), 0) AS income, COALESCE(SUM(CASE WHEN amount_minor < 0 THEN -amount_minor ELSE 0 END), 0) AS expenses FROM finance_transactions WHERE telegram_id=? AND is_internal_transfer=0 AND occurred_at>=?",
-            (telegram_id, start),
+            f"SELECT COALESCE(SUM(CASE WHEN amount_minor > 0 THEN amount_minor ELSE 0 END), 0) AS income, COALESCE(SUM(CASE WHEN amount_minor < 0 THEN -amount_minor ELSE 0 END), 0) AS expenses FROM finance_transactions WHERE telegram_id=? AND is_internal_transfer=0 AND {period_filter}",
+            (telegram_id, *period_params),
         )).fetchone()
         currency_totals = await (await db.execute(
-            "SELECT currency_code, COALESCE(SUM(CASE WHEN amount_minor > 0 THEN amount_minor ELSE 0 END), 0) AS income, COALESCE(SUM(CASE WHEN amount_minor < 0 THEN -amount_minor ELSE 0 END), 0) AS expenses FROM finance_transactions WHERE telegram_id=? AND is_internal_transfer=0 AND occurred_at>=? GROUP BY currency_code ORDER BY currency_code",
-            (telegram_id, start),
+            f"SELECT currency_code, COALESCE(SUM(CASE WHEN amount_minor > 0 THEN amount_minor ELSE 0 END), 0) AS income, COALESCE(SUM(CASE WHEN amount_minor < 0 THEN -amount_minor ELSE 0 END), 0) AS expenses FROM finance_transactions WHERE telegram_id=? AND is_internal_transfer=0 AND {period_filter} GROUP BY currency_code ORDER BY currency_code",
+            (telegram_id, *period_params),
         )).fetchall()
         categories = await (await db.execute(
             "SELECT c.id AS category_id, c.name AS name, COALESCE(g.budget_group, c.budget_group) AS budget_group, "
             "t.currency_code, SUM(-t.amount_minor) AS amount "
             "FROM finance_transactions t JOIN finance_categories c ON c.id=t.category_id "
             "LEFT JOIN finance_category_budget_groups g ON g.category_id=c.id AND g.telegram_id=t.telegram_id "
-            "WHERE t.telegram_id=? AND t.is_internal_transfer=0 AND t.amount_minor<0 AND t.occurred_at>=? "
+            f"WHERE t.telegram_id=? AND t.is_internal_transfer=0 AND t.amount_minor<0 AND t.{period_filter} "
             "GROUP BY c.id, c.name, COALESCE(g.budget_group, c.budget_group), t.currency_code ORDER BY amount DESC",
-            (telegram_id, start),
+            (telegram_id, *period_params),
         )).fetchall()
-        uncategorized = await (await db.execute("SELECT COUNT(*) AS count FROM finance_transactions WHERE telegram_id=? AND is_internal_transfer=0 AND category_id IS NULL AND occurred_at>=?", (telegram_id, start))).fetchone()
+        uncategorized = await (await db.execute(f"SELECT COUNT(*) AS count FROM finance_transactions WHERE telegram_id=? AND is_internal_transfer=0 AND category_id IS NULL AND {period_filter}", (telegram_id, *period_params))).fetchone()
         logger.debug(
             "Finance summary user=%s start=%s categories=%s uncategorized=%s",
             telegram_id,

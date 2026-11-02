@@ -200,7 +200,7 @@ class FinanceService:
 
     async def dashboard(self, telegram_id: int) -> dict[str, Any]:
         info = await self.account_info(telegram_id)
-        summary = await self.db.finance_summary(telegram_id, 30)
+        summary = await self.db.finance_summary(telegram_id, calendar_month=True)
         daily_avg = int(summary["expenses"]) / 100.0 / 30
         account_rows = await self.db.finance_accounts(telegram_id)
         jars = await self.db.finance_jars(telegram_id)
@@ -258,6 +258,7 @@ class FinanceService:
             "jar_balances_by_currency": jars_by_currency,
             "balances_by_currency": balances_by_currency,
             "daily_avg": daily_avg,
+            "period_label": "поточний календарний місяць",
             "runway_days": round(balance_minor / 100.0 / daily_avg) if balance_minor > 0 and daily_avg > 0 else None,
             "budget": shares,
         }
