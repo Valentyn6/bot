@@ -1204,6 +1204,10 @@ class Database:
             f"SELECT currency_code, COALESCE(SUM(CASE WHEN amount_minor > 0 THEN amount_minor ELSE 0 END), 0) AS income, COALESCE(SUM(CASE WHEN amount_minor < 0 THEN -amount_minor ELSE 0 END), 0) AS expenses FROM finance_transactions WHERE telegram_id=? AND is_internal_transfer=0 AND {period_filter} GROUP BY currency_code ORDER BY currency_code",
             (telegram_id, *period_params),
         )).fetchall()
+        internal_transfer_totals = await (await db.execute(
+            f"SELECT currency_code, COALESCE(SUM(amount_minor), 0) AS net FROM finance_transactions WHERE telegram_id=? AND is_internal_transfer=1 AND {period_filter} GROUP BY currency_code ORDER BY currency_code",
+            (telegram_id, *period_params),
+        )).fetchall()
         categories = await (await db.execute(
             "SELECT c.id AS category_id, c.name AS name, COALESCE(g.budget_group, c.budget_group) AS budget_group, "
             "t.currency_code, SUM(-t.amount_minor) AS amount "
@@ -1221,7 +1225,7 @@ class Database:
             [dict(row) for row in categories],
             uncategorized["count"],
         )
-        return {"income": totals["income"], "expenses": totals["expenses"], "currency_totals": currency_totals, "categories": categories, "top_categories": categories[:3], "uncategorized": uncategorized["count"]}
+        return {"income": totals["income"], "expenses": totals["expenses"], "currency_totals": currency_totals, "internal_transfer_totals": internal_transfer_totals, "categories": categories, "top_categories": categories[:3], "uncategorized": uncategorized["count"]}
 
     async def previous_month_income(self, telegram_id: int) -> int:
         today = local_today()

@@ -351,6 +351,7 @@ def test_account_migration_transactions_are_internal_after_database_migration(tm
         assert transaction["category_id"] is None
         assert summary["income"] == 0
         assert summary["expenses"] == 0
+        assert summary["internal_transfer_totals"][0]["net"] == -567501
         assert summary["categories"] == []
         await database.close()
 
@@ -410,6 +411,7 @@ def test_jar_top_up_and_withdrawal_are_internal_transfers(tmp_path):
         assert all(transaction["category_id"] is None for transaction in transactions)
         assert summary["income"] == 0
         assert summary["expenses"] == 0
+        assert summary["internal_transfer_totals"][0]["net"] == -84900
         assert summary["categories"] == []
         await database.close()
 

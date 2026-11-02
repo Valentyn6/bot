@@ -115,10 +115,14 @@ def dashboard_text(data: dict) -> str:
     uah_income = income_by_currency.get(980, 0)
     uah_expenses = expenses_by_currency.get(980, 0)
     budget_income = int(data.get("budget_income", uah_income))
+    internal_net_by_currency = {
+        int(row["currency_code"]): int(row["net"])
+        for row in summary.get("internal_transfer_totals", [])
+    }
     uah_categories = [row for row in category_rows if int(row_value(row, "currency_code", 980)) == 980]
     needs_spent = sum(int(row["amount"]) for row in uah_categories if row_value(row, "budget_group", "exclude") == "needs")
     wants_spent = sum(int(row["amount"]) for row in uah_categories if row_value(row, "budget_group", "exclude") == "wants")
-    leftover = max(0, uah_income - uah_expenses)
+    leftover = max(0, uah_income - uah_expenses + internal_net_by_currency.get(980, 0))
     budget_values = [("Потреби", needs, needs_spent), ("Бажання", wants, wants_spent), ("Залишок доходу", savings, leftover)]
     budget_lines = []
     if budget_income > 0:
@@ -136,7 +140,7 @@ def dashboard_text(data: dict) -> str:
             )
         budget_text = "\n".join(budget_lines) + (
             f"\n<i>План розраховано за доходом минулого місяця: {money(budget_income)}.</i>"
-            "\n<i>Потреби й бажання — оцінка за категоріями. Залишок доходу не означає, що ці кошти переказані в скарбничку.</i>"
+            "\n<i>Потреби й бажання — оцінка за категоріями. Залишок доходу враховує перекази до скарбничок, але не дорівнює їхньому поточному балансу.</i>"
         )
     else:
         budget_text = "Немає доходу за минулий місяць, щоб сформувати бюджетний план."
