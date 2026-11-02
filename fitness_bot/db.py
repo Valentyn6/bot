@@ -539,7 +539,10 @@ class Database:
             await self._db().execute("ALTER TABLE finance_transactions ADD COLUMN is_internal_transfer INTEGER NOT NULL DEFAULT 0")
         await self._db().execute(
             "UPDATE finance_transactions SET is_internal_transfer=1, category_id=NULL "
-            "WHERE source='monobank' AND LOWER(description) LIKE '%міграції рахунку%'"
+            "WHERE source='monobank' AND ("
+            "LOWER(description) LIKE '%міграції рахунку%' "
+            "OR description LIKE '%Поповнення «%' "
+            "OR description LIKE '%Часткове зняття банки%')"
         )
         await self._db().execute("CREATE INDEX IF NOT EXISTS idx_finance_transactions_goal ON finance_transactions(goal_id)")
 

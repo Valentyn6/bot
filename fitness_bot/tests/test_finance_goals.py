@@ -381,6 +381,39 @@ def test_income_only_category_is_not_listed_as_expense_category(tmp_path):
     asyncio.run(scenario())
 
 
+def test_jar_top_up_and_withdrawal_are_internal_transfers(tmp_path):
+    async def scenario():
+        database = Database(str(tmp_path / "finance-jar-transfers.sqlite3"))
+        await database.connect()
+        await database.ensure_account(1)
+        category_id = next(row["id"] for row in await database.finance_categories(1) if "інше" in row["name"].casefold())
+        for amount, description, transaction_id in (
+            (-85000, "Поповнення «Навчання»", "jar-top-up"),
+            (100, "Часткове зняття банки «Навчання»", "jar-withdrawal"),
+        ):
+            assert await database.add_finance_transaction(1, {
+                "amount_minor": amount,
+                "mono_transaction_id": transaction_id,
+                "category_id": category_id,
+                "description": description,
+                "source": "monobank",
+                "occurred_at": "2999-01-01T10:00:00",
+            }) is not None
+        await database._migrate_finance_transactions()
+        await database._db().commit()
+
+        transactions = await database.finance_transactions(1, 2)
+        summary = await database.finance_summary(1, 300000)
+        assert all(transaction["is_internal_transfer"] == 1 for transaction in transactions)
+        assert all(transaction["category_id"] is None for transaction in transactions)
+        assert summary["income"] == 0
+        assert summary["expenses"] == 0
+        assert summary["categories"] == []
+        await database.close()
+
+    asyncio.run(scenario())
+
+
 def test_finance_dashboard_uses_cached_balances_when_monobank_fails(tmp_path, monkeypatch):
     async def scenario():
         database = Database(str(tmp_path / "finance-cache.sqlite3"))

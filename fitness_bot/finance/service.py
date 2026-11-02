@@ -12,7 +12,11 @@ logger = logging.getLogger(__name__)
 
 def is_internal_transfer(description: str) -> bool:
     normalized = " ".join((description or "").casefold().split())
-    return "в рамках міграції рахунку" in normalized
+    return (
+        "в рамках міграції рахунку" in normalized
+        or "поповнення «" in normalized
+        or "часткове зняття банки" in normalized
+    )
 
 
 class FinanceService:
