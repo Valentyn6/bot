@@ -119,21 +119,54 @@ def dashboard_text(data: dict) -> str:
         int(row["currency_code"]): int(row["net"])
         for row in summary.get("internal_transfer_totals", [])
     }
+    allocation_mode = data.get("allocation_mode", "spent")
     uah_categories = [row for row in category_rows if int(row_value(row, "currency_code", 980)) == 980]
     needs_spent = sum(int(row["amount"]) for row in uah_categories if row_value(row, "budget_group", "exclude") == "needs")
     wants_spent = sum(int(row["amount"]) for row in uah_categories if row_value(row, "budget_group", "exclude") == "wants")
     leftover = max(0, uah_income - uah_expenses + internal_net_by_currency.get(980, 0))
-    budget_values = [("Потреби", needs, needs_spent), ("Бажання", wants, wants_spent), ("Залишок доходу", savings, leftover)]
+    need_limit = budget_income * needs / 100
+    want_limit = budget_income * wants / 100
+    savings_limit = budget_income * savings / 100
+    if allocation_mode == "balance":
+        available = max(0, sum(max(0, int(amount)) for code, amount in account_groups.items() if int(code) == 980))
+        budget_values = [
+            ("Потреби", needs, available * needs / 100),
+            ("Бажання", wants, available * wants / 100),
+            ("Залишок доходу", savings, available * savings / 100),
+        ]
+    elif allocation_mode == "priority":
+        available = max(0, sum(max(0, int(amount)) for code, amount in account_groups.items() if int(code) == 980))
+        needs_available = min(available, need_limit)
+        wants_available = min(max(0, available - needs_available), want_limit)
+        budget_values = [
+            ("Потреби", needs, needs_available),
+            ("Бажання", wants, wants_available),
+            ("Залишок доходу", savings, max(0, available - needs_available - wants_available)),
+        ]
+    elif allocation_mode == "remaining":
+        budget_values = [("Потреби", needs, max(0, need_limit - needs_spent)), ("Бажання", wants, max(0, want_limit - wants_spent)), ("Залишок доходу", savings, leftover)]
+    else:
+        budget_values = [("Потреби", needs, needs_spent), ("Бажання", wants, wants_spent), ("Залишок доходу", savings, leftover)]
     budget_lines = []
     if budget_income > 0:
         for name, percent, spent in budget_values:
             limit = budget_income * percent / 100
             ratio = spent / limit if limit > 0 else 0
-            progress_ratio = ratio if name == "Залишок доходу" else max(0, 1 - ratio)
+            if allocation_mode == "spent":
+                progress_ratio = ratio
+            elif allocation_mode == "remaining":
+                progress_ratio = ratio
+            else:
+                progress_ratio = ratio
             visual_progress = min(100, round(progress_ratio * 100))
             filled = round(visual_progress / 10)
-            state = f"перевищено на {money(spent - limit)}" if limit > 0 and spent > limit else f"залишилось {money(limit - spent)}"
-            if name == "Залишок доходу":
+            if allocation_mode in {"balance", "priority"}:
+                state = f"доступно {money(spent)} із плану {money(limit)}"
+            elif allocation_mode == "remaining":
+                state = f"залишилось {money(spent)}"
+            else:
+                state = f"перевищено на {money(spent - limit)}" if limit > 0 and spent > limit else f"залишилось {money(limit - spent)}"
+            if name == "Залишок доходу" and allocation_mode == "spent":
                 state = f"факт {money(spent)} із плану {money(limit)}"
             budget_lines.append(
                 f"• <b>{name}</b> · план {percent:g}% ({money(limit)})\n"
@@ -223,6 +256,7 @@ def settings_menu() -> InlineKeyboardMarkup:
         [("🏷 Назви карток", "finance:settings:accounts")],
         [("🏷 Категорії витрат", "finance:settings:categories")],
         [("📊 Вибрати пресет бюджету", "finance:settings:budget")],
+        [("⚖️ Режим розподілу коштів", "finance:settings:allocation")],
         [("🗑 Видалити токен", "finance:settings:remove")],
         [("← До фінансів", "finance:menu")],
     ])
@@ -266,6 +300,41 @@ async def finance_menu(callback: CallbackQuery) -> None:
         await callback.answer(f"Не вдалося завантажити dashboard: {exc}", show_alert=True)
         return
     await callback.message.edit_text(dashboard_text(data), reply_markup=dashboard_menu(data["summary"]["uncategorized"]), parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "finance:settings:allocation")
+async def allocation_settings(callback: CallbackQuery) -> None:
+    if not await allowed(callback):
+        return
+    current = await _db.finance_allocation_mode(callback.from_user.id)  # type: ignore[union-attr]
+    labels = {
+        "spent": "Витрачено від плану",
+        "balance": "Баланс за пресетом",
+        "priority": "Спочатку потреби",
+        "remaining": "Залишок плану",
+    }
+    await callback.message.edit_text(
+        f"⚖️ <b>Режим розподілу коштів</b>\nПоточний: <b>{labels[current]}</b>",
+        reply_markup=keyboard([
+            [("💸 Витрачено від плану", "finance:allocation:spent")],
+            [("💰 Баланс за пресетом", "finance:allocation:balance")],
+            [("🧺 Спочатку потреби", "finance:allocation:priority")],
+            [("📉 Залишок плану", "finance:allocation:remaining")],
+            [("← До налаштувань", "finance:settings")],
+        ]),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("finance:allocation:"))
+async def allocation_mode_set(callback: CallbackQuery) -> None:
+    if not await allowed(callback):
+        return
+    mode = callback.data.rsplit(":", 1)[-1]
+    await _db.set_finance_allocation_mode(callback.from_user.id, mode)  # type: ignore[union-attr]
+    await callback.message.edit_text("✅ Режим розподілу коштів збережено.", reply_markup=settings_menu())
     await callback.answer()
 
 

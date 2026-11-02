@@ -244,6 +244,7 @@ class FinanceService:
             balance_minor / 100.0,
         )
         budget = await self.db.active_budget(telegram_id)
+        allocation_mode = await self.db.finance_allocation_mode(telegram_id)
         shares = (
             (budget["needs_percent"], budget["wants_percent"], budget["savings_percent"])
             if budget
@@ -263,6 +264,7 @@ class FinanceService:
             "period_label": "поточний календарний місяць",
             "runway_days": round(balance_minor / 100.0 / daily_avg) if balance_minor > 0 and daily_avg > 0 else None,
             "budget": shares,
+            "allocation_mode": allocation_mode,
         }
 
     async def comparison(self, telegram_id: int) -> dict[str, Any]:

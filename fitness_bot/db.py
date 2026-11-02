@@ -187,6 +187,11 @@ CREATE TABLE IF NOT EXISTS finance_budgets (
     UNIQUE(telegram_id, name),
     FOREIGN KEY(telegram_id) REFERENCES telegram_accounts(telegram_id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS finance_preferences (
+    telegram_id INTEGER PRIMARY KEY,
+    allocation_mode TEXT NOT NULL DEFAULT 'spent',
+    FOREIGN KEY(telegram_id) REFERENCES telegram_accounts(telegram_id) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS finance_accounts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     monobank_account_id INTEGER NOT NULL,
@@ -1147,6 +1152,21 @@ class Database:
 
     async def active_budget(self, telegram_id: int) -> aiosqlite.Row | None:
         return await (await self._db().execute("SELECT * FROM finance_budgets WHERE telegram_id=? AND is_active=1 LIMIT 1", (telegram_id,))).fetchone()
+
+    async def finance_allocation_mode(self, telegram_id: int) -> str:
+        row = await (await self._db().execute("SELECT allocation_mode FROM finance_preferences WHERE telegram_id=?", (telegram_id,))).fetchone()
+        return str(row["allocation_mode"]) if row else "spent"
+
+    async def set_finance_allocation_mode(self, telegram_id: int, mode: str) -> None:
+        if mode not in {"spent", "balance", "priority", "remaining"}:
+            raise ValueError("Невідомий режим розподілу коштів.")
+        db = self._db()
+        await db.execute(
+            "INSERT INTO finance_preferences(telegram_id, allocation_mode) VALUES (?, ?) "
+            "ON CONFLICT(telegram_id) DO UPDATE SET allocation_mode=excluded.allocation_mode",
+            (telegram_id, mode),
+        )
+        await db.commit()
 
     async def add_finance_transaction(self, telegram_id: int, values: dict[str, Any]) -> int | None:
         db = self._db()
