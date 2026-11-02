@@ -129,14 +129,15 @@ def dashboard_text(data: dict) -> str:
         for name, percent, spent in budget_values:
             limit = budget_income * percent / 100
             ratio = spent / limit if limit > 0 else 0
-            visual_progress = min(100, round(ratio * 100))
+            progress_ratio = ratio if name == "Залишок доходу" else max(0, 1 - ratio)
+            visual_progress = min(100, round(progress_ratio * 100))
             filled = round(visual_progress / 10)
             state = f"перевищено на {money(spent - limit)}" if limit > 0 and spent > limit else f"залишилось {money(limit - spent)}"
             if name == "Залишок доходу":
                 state = f"факт {money(spent)} із плану {money(limit)}"
             budget_lines.append(
                 f"• <b>{name}</b> · план {percent:g}% ({money(limit)})\n"
-                f"  [{'▓' * filled}{'░' * (10 - filled)}] {ratio * 100:.0f}% · {state}"
+                f"  [{'▓' * filled}{'░' * (10 - filled)}] {progress_ratio * 100:.0f}% · {state}"
             )
         budget_text = "\n".join(budget_lines) + (
             f"\n<i>План розраховано за доходом минулого місяця: {money(budget_income)}.</i>"
