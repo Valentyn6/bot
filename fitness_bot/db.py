@@ -1260,6 +1260,29 @@ class Database:
         )).fetchall()
         return {"income": int(row["income"]), "expenses": int(row["expenses"]), "currency_totals": currency_rows}
 
+    async def finance_calendar_month_summary(self, telegram_id: int, months_ago: int = 0) -> dict[str, int]:
+        today = local_today()
+        month_index = today.year * 12 + today.month - 1 - months_ago
+        year, month_index = divmod(month_index, 12)
+        month_start = date(year, month_index + 1, 1)
+        next_month = month_start + timedelta(days=32)
+        next_month = date(next_month.year, next_month.month, 1)
+        start, end = local_date_range_utc_naive(month_start.isoformat(), (next_month - timedelta(days=1)).isoformat())
+        row = await (await self._db().execute(
+            "SELECT COALESCE(SUM(CASE WHEN amount_minor > 0 THEN amount_minor ELSE 0 END), 0) AS income, "
+            "COALESCE(SUM(CASE WHEN amount_minor < 0 THEN -amount_minor ELSE 0 END), 0) AS expenses "
+            "FROM finance_transactions WHERE telegram_id=? AND is_internal_transfer=0 AND occurred_at>=? AND occurred_at<?",
+            (telegram_id, start, end),
+        )).fetchone()
+        currency_rows = await (await self._db().execute(
+            "SELECT currency_code, COALESCE(SUM(CASE WHEN amount_minor > 0 THEN amount_minor ELSE 0 END), 0) AS income, "
+            "COALESCE(SUM(CASE WHEN amount_minor < 0 THEN -amount_minor ELSE 0 END), 0) AS expenses "
+            "FROM finance_transactions WHERE telegram_id=? AND is_internal_transfer=0 AND occurred_at>=? AND occurred_at<? "
+            "GROUP BY currency_code ORDER BY currency_code",
+            (telegram_id, start, end),
+        )).fetchall()
+        return {"income": int(row["income"]), "expenses": int(row["expenses"]), "currency_totals": currency_rows}
+
     async def uncategorized_transactions(self, telegram_id: int, limit: int = 20) -> list[aiosqlite.Row]:
         return await (await self._db().execute(
             "SELECT t.*, COALESCE(fa.alias, t.account_label) AS display_account_label FROM finance_transactions t LEFT JOIN finance_accounts fa ON fa.id=t.finance_account_id WHERE t.telegram_id=? AND t.category_id IS NULL ORDER BY t.occurred_at DESC, t.id DESC LIMIT ?",

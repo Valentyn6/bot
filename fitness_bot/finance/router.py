@@ -193,7 +193,7 @@ def comparison_text(data: dict) -> str:
 
     current_by_currency = current.get("currency_totals", [{"currency_code": 980, "income": current["income"], "expenses": current["expenses"]}])
     previous_by_currency = {int(row["currency_code"]): row for row in (previous.get("currency_totals") or [])}
-    lines = ["📊 <b>Порівняння періодів</b>", "<i>Останні 30 днів проти попередніх 30 днів</i>"]
+    lines = ["📊 <b>Порівняння періодів</b>", "<i>Поточний календарний місяць проти попереднього</i>"]
     for row in current_by_currency:
         code = int(row["currency_code"])
         prior = previous_by_currency.get(code, {"income": 0, "expenses": 0})
@@ -794,7 +794,7 @@ async def category_budget_choices(callback: CallbackQuery) -> None:
     ]
     await callback.message.edit_text(
         f"🏷 <b>{escape(category['name'])}</b>\n\nПоточна група: <b>{labels.get(category['budget_group'], 'Не класифікувати')}</b>\n\n"
-        "Зміна застосовується до підсумків за останні 30 днів і до наступних звітів.",
+        "Зміна застосовується до підсумків поточного календарного місяця і до наступних звітів.",
         reply_markup=keyboard(rows), parse_mode="HTML",
     )
     await callback.answer()

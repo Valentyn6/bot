@@ -70,7 +70,7 @@ def test_finance_comparison_labels_periods_and_currencies():
         "income_diff_pct": 100,
         "expenses_diff_pct": 100,
     })
-    assert "Останні 30 днів проти попередніх 30 днів" in text
+    assert "Поточний календарний місяць проти попереднього" in text
     assert "Витрати: 200.00 ₴ · раніше 100.00 ₴" in text
     assert "Зміна надходжень: ▲ +100.0%" in text
 
@@ -280,8 +280,9 @@ def test_finance_mcc_rules_and_analytics(tmp_path, monkeypatch):
         assert category_for_mcc(4814) == "Комунальні"
 
         now = datetime.now() - timedelta(minutes=1)
+        previous_month = now.replace(day=1) - timedelta(days=1)
         await database.add_finance_transaction(1, {"monobank_account_id": monobank_id, "amount_minor": -300000, "description": "Поточна витрата", "occurred_at": now.isoformat(timespec="seconds")})
-        await database.add_finance_transaction(1, {"monobank_account_id": monobank_id, "amount_minor": -150000, "description": "Минула витрата", "occurred_at": (now - timedelta(days=40)).isoformat(timespec="seconds")})
+        await database.add_finance_transaction(1, {"monobank_account_id": monobank_id, "amount_minor": -150000, "description": "Минула витрата", "occurred_at": previous_month.replace(day=15, hour=12).isoformat(timespec="seconds")})
 
         class SuccessfulClient:
             def __init__(self, token):

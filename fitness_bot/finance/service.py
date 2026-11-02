@@ -266,8 +266,8 @@ class FinanceService:
         }
 
     async def comparison(self, telegram_id: int) -> dict[str, Any]:
-        current = await self.db.finance_period_summary(telegram_id, 0, 30)
-        previous = await self.db.finance_period_summary(telegram_id, 30, 60)
+        current = await self.db.finance_calendar_month_summary(telegram_id, 0)
+        previous = await self.db.finance_calendar_month_summary(telegram_id, 1)
         previous_expenses = previous["expenses"]
         diff_pct = ((current["expenses"] - previous_expenses) / previous_expenses * 100) if previous_expenses else None
         income_diff_pct = ((current["income"] - previous["income"]) / previous["income"] * 100) if previous["income"] else None
