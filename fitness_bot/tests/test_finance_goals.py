@@ -355,6 +355,32 @@ def test_account_migration_transactions_are_internal_after_database_migration(tm
     asyncio.run(scenario())
 
 
+def test_income_only_category_is_not_listed_as_expense_category(tmp_path):
+    async def scenario():
+        database = Database(str(tmp_path / "finance-income-category.sqlite3"))
+        await database.connect()
+        await database.ensure_account(1)
+        category_id = await database.create_finance_category(1, "Фінансування від Ольги Ігорівни")
+        await database.add_finance_transaction(1, {
+            "amount_minor": 70000,
+            "category_id": category_id,
+            "description": "Від: Kovalska Olha",
+            "source": "monobank",
+            "occurred_at": "2999-01-01T10:00:00",
+        })
+        await database._migrate_finance_categories()
+        await database._db().commit()
+
+        categories = await database.finance_categories(1)
+        expense_categories = await database.finance_categories(1, kind="expense")
+        income_category = next(category for category in categories if category["id"] == category_id)
+        assert income_category["kind"] == "income"
+        assert category_id not in {category["id"] for category in expense_categories}
+        await database.close()
+
+    asyncio.run(scenario())
+
+
 def test_finance_dashboard_uses_cached_balances_when_monobank_fails(tmp_path, monkeypatch):
     async def scenario():
         database = Database(str(tmp_path / "finance-cache.sqlite3"))

@@ -520,6 +520,12 @@ class Database:
                     "wants" if any(marker in name for marker in wants_markers) else "exclude"
                 )
                 await db.execute("UPDATE finance_categories SET budget_group=? WHERE id=?", (group, category["id"]))
+        await db.execute(
+            "UPDATE finance_categories SET kind='income' "
+            "WHERE telegram_id IS NOT NULL "
+            "AND EXISTS (SELECT 1 FROM finance_transactions t WHERE t.category_id=finance_categories.id AND t.amount_minor>0) "
+            "AND NOT EXISTS (SELECT 1 FROM finance_transactions t WHERE t.category_id=finance_categories.id AND t.amount_minor<0)"
+        )
 
     async def _migrate_finance_transactions(self) -> None:
         columns = {row[1] for row in await (await self._db().execute("PRAGMA table_info(finance_transactions)")).fetchall()}
@@ -1024,15 +1030,17 @@ class Database:
             raise ValueError("Для цієї транзакції немає MCC-коду.")
         return await self.save_finance_mcc_rule(telegram_id, int(row["mcc"]), category_id)
 
-    async def finance_categories(self, telegram_id: int) -> list[aiosqlite.Row]:
+    async def finance_categories(self, telegram_id: int, kind: str | None = None) -> list[aiosqlite.Row]:
+        kind_filter = " AND c.kind=?" if kind else ""
+        parameters: tuple[int, ...] | tuple[int, str] = (telegram_id, telegram_id, kind) if kind else (telegram_id, telegram_id)
         rows = await (await self._db().execute(
             "SELECT c.id, c.telegram_id, c.name, c.kind, c.mcc_codes, "
             "COALESCE(g.budget_group, c.budget_group) AS budget_group "
             "FROM finance_categories c LEFT JOIN finance_category_budget_groups g "
             "ON g.category_id=c.id AND g.telegram_id=? "
-            "WHERE c.telegram_id IS NULL OR c.telegram_id=? "
+            "WHERE (c.telegram_id IS NULL OR c.telegram_id=?) " + kind_filter + " "
             "ORDER BY c.telegram_id IS NOT NULL, c.name, c.id",
-            (telegram_id, telegram_id),
+            parameters,
         )).fetchall()
         unique: dict[str, aiosqlite.Row] = {}
         for row in rows:

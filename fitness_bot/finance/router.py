@@ -396,7 +396,7 @@ async def uncategorized_categories(callback: CallbackQuery) -> None:
     if not await allowed(callback):
         return
     transaction_id = int(callback.data.rsplit(":", 1)[1])
-    categories = await _db.finance_categories(callback.from_user.id)  # type: ignore[union-attr]
+    categories = await _db.finance_categories(callback.from_user.id, kind="expense")  # type: ignore[union-attr]
     rows = [[(category["name"], f"finance:uncategorized:set:{transaction_id}:{category['id']}")] for category in categories]
     rows.append([("➕ Додати категорію", f"finance:add-category:{transaction_id}")])
     rows.append([("← До нерозподілених", "finance:uncategorized")])
@@ -739,7 +739,7 @@ async def goal_link(callback: CallbackQuery) -> None:
 async def settings_categories(callback: CallbackQuery) -> None:
     if not await allowed(callback):
         return
-    categories = await _db.finance_categories(callback.from_user.id)  # type: ignore[union-attr]
+    categories = await _db.finance_categories(callback.from_user.id, kind="expense")  # type: ignore[union-attr]
     text, markup = category_settings_view(categories)
     await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
     await callback.answer()
@@ -775,7 +775,7 @@ async def category_budget_choices(callback: CallbackQuery) -> None:
     except (AttributeError, ValueError):
         await callback.answer("Некоректна категорія.", show_alert=True)
         return
-    categories = await _db.finance_categories(callback.from_user.id)  # type: ignore[union-attr]
+    categories = await _db.finance_categories(callback.from_user.id, kind="expense")  # type: ignore[union-attr]
     category = next((item for item in categories if int(item["id"]) == category_id), None)
     if not category:
         await callback.answer("Категорію не знайдено.", show_alert=True)
@@ -812,7 +812,7 @@ async def category_budget_set(callback: CallbackQuery) -> None:
     if not await _db.set_finance_category_budget_group(callback.from_user.id, category_id, group):  # type: ignore[union-attr]
         await callback.answer("Категорію не знайдено.", show_alert=True)
         return
-    categories = await _db.finance_categories(callback.from_user.id)  # type: ignore[union-attr]
+    categories = await _db.finance_categories(callback.from_user.id, kind="expense")  # type: ignore[union-attr]
     text, markup = category_settings_view(categories)
     await callback.message.edit_text("✅ Групу категорії змінено.\n\n" + text, reply_markup=markup, parse_mode="HTML")
     await callback.answer("Групу оновлено")
