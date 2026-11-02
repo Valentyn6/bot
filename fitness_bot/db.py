@@ -1223,6 +1223,18 @@ class Database:
         )
         return {"income": totals["income"], "expenses": totals["expenses"], "currency_totals": currency_totals, "categories": categories, "top_categories": categories[:3], "uncategorized": uncategorized["count"]}
 
+    async def previous_month_income(self, telegram_id: int) -> int:
+        today = local_today()
+        current_month = date(today.year, today.month, 1)
+        previous_month = date(current_month.year, current_month.month - 1, 1) if current_month.month > 1 else date(current_month.year - 1, 12, 1)
+        start, end = local_date_range_utc_naive(previous_month.isoformat(), (current_month - timedelta(days=1)).isoformat())
+        row = await (await self._db().execute(
+            "SELECT COALESCE(SUM(amount_minor), 0) AS income FROM finance_transactions "
+            "WHERE telegram_id=? AND currency_code=980 AND amount_minor>0 AND is_internal_transfer=0 AND occurred_at>=? AND occurred_at<?",
+            (telegram_id, start, end),
+        )).fetchone()
+        return int(row["income"])
+
     async def finance_report_summary(self, telegram_id: int, start_date: str, end_date: str) -> list[aiosqlite.Row]:
         start, end = local_date_range_utc_naive(start_date, end_date)
         return await (await self._db().execute(

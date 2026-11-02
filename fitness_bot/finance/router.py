@@ -114,15 +114,16 @@ def dashboard_text(data: dict) -> str:
     category_rows = summary["categories"]
     uah_income = income_by_currency.get(980, 0)
     uah_expenses = expenses_by_currency.get(980, 0)
+    budget_income = int(data.get("budget_income", uah_income))
     uah_categories = [row for row in category_rows if int(row_value(row, "currency_code", 980)) == 980]
     needs_spent = sum(int(row["amount"]) for row in uah_categories if row_value(row, "budget_group", "exclude") == "needs")
     wants_spent = sum(int(row["amount"]) for row in uah_categories if row_value(row, "budget_group", "exclude") == "wants")
     leftover = max(0, uah_income - uah_expenses)
     budget_values = [("Потреби", needs, needs_spent), ("Бажання", wants, wants_spent), ("Залишок доходу", savings, leftover)]
     budget_lines = []
-    if uah_income > 0:
+    if budget_income > 0:
         for name, percent, spent in budget_values:
-            limit = uah_income * percent / 100
+            limit = budget_income * percent / 100
             ratio = spent / limit if limit > 0 else 0
             visual_progress = min(100, round(ratio * 100))
             filled = round(visual_progress / 10)
@@ -133,9 +134,12 @@ def dashboard_text(data: dict) -> str:
                 f"• <b>{name}</b> · план {percent:g}% ({money(limit)})\n"
                 f"  [{'▓' * filled}{'░' * (10 - filled)}] {ratio * 100:.0f}% · {state}"
             )
-        budget_text = "\n".join(budget_lines) + "\n<i>Потреби й бажання — оцінка за категоріями. Залишок доходу не означає, що ці кошти переказані в скарбничку.</i>"
+        budget_text = "\n".join(budget_lines) + (
+            f"\n<i>План розраховано за доходом минулого місяця: {money(budget_income)}.</i>"
+            "\n<i>Потреби й бажання — оцінка за категоріями. Залишок доходу не означає, що ці кошти переказані в скарбничку.</i>"
+        )
     else:
-        budget_text = "Додайте дохід у гривні за цей період, щоб порівняти витрати з бюджетним планом."
+        budget_text = "Немає доходу за минулий місяць, щоб сформувати бюджетний план."
 
     category_lines = []
     for code in sorted({int(row_value(row, "currency_code", 980)) for row in category_rows}):

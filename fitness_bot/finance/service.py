@@ -201,6 +201,7 @@ class FinanceService:
     async def dashboard(self, telegram_id: int) -> dict[str, Any]:
         info = await self.account_info(telegram_id)
         summary = await self.db.finance_summary(telegram_id, calendar_month=True)
+        budget_income = await self.db.previous_month_income(telegram_id)
         daily_avg = int(summary["expenses"]) / 100.0 / 30
         account_rows = await self.db.finance_accounts(telegram_id)
         jars = await self.db.finance_jars(telegram_id)
@@ -251,6 +252,7 @@ class FinanceService:
         return {
             "info": info,
             "summary": summary,
+            "budget_income": budget_income,
             "jars": jars,
             "balance_minor": balance_minor,
             "balance_uah": balance_minor / 100.0,
