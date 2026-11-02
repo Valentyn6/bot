@@ -104,13 +104,11 @@ def dashboard_text(data: dict) -> str:
 
     needs, wants, savings = data["budget"]
     category_rows = summary["categories"]
-    needs_names = ("продукт", "транспорт", "комуналь", "зв'язок", "здоров")
-    wants_names = ("кафе", "рестора", "розваг", "дозвіл", "покуп", "одяг")
     uah_income = income_by_currency.get(980, 0)
     uah_expenses = expenses_by_currency.get(980, 0)
     uah_categories = [row for row in category_rows if int(row_value(row, "currency_code", 980)) == 980]
-    needs_spent = sum(int(row["amount"]) for row in uah_categories if any(marker in row["name"].casefold() for marker in needs_names))
-    wants_spent = sum(int(row["amount"]) for row in uah_categories if any(marker in row["name"].casefold() for marker in wants_names))
+    needs_spent = sum(int(row["amount"]) for row in uah_categories if row_value(row, "budget_group", "exclude") == "needs")
+    wants_spent = sum(int(row["amount"]) for row in uah_categories if row_value(row, "budget_group", "exclude") == "wants")
     leftover = max(0, uah_income - uah_expenses)
     budget_values = [("Потреби", needs, needs_spent), ("Бажання", wants, wants_spent), ("Залишок доходу", savings, leftover)]
     budget_lines = []
@@ -710,11 +708,82 @@ async def settings_categories(callback: CallbackQuery) -> None:
     if not await allowed(callback):
         return
     categories = await _db.finance_categories(callback.from_user.id)  # type: ignore[union-attr]
-    rows = [[("➕ Додати категорію", "finance:add-category")]]
-    rows.append([("← До налаштувань", "finance:settings")])
-    category_list = "\n".join(f"• {escape(category['name'])}" for category in categories) or "Категорій ще немає."
-    await callback.message.edit_text("🏷 <b>Категорії витрат</b>\n\n" + category_list, reply_markup=keyboard(rows), parse_mode="HTML")
+    text, markup = category_settings_view(categories)
+    await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
     await callback.answer()
+
+
+def category_settings_view(categories) -> tuple[str, InlineKeyboardMarkup]:
+    labels = {"needs": "🧺 Потреби", "wants": "✨ Бажання", "exclude": "⚪ Не класифікувати"}
+    category_list = "\n".join(
+        f"• {escape(category['name'])} — {labels.get(category['budget_group'], labels['exclude'])}"
+        for category in categories
+    ) or "Категорій ще немає."
+    rows = [
+        [(f"{category['name'][:30]} · {labels.get(category['budget_group'], 'Не класиф.')}", f"finance:category-budget:{category['id']}")]
+        for category in categories
+    ]
+    rows.extend([[ ("➕ Додати категорію", "finance:add-category")], [("← До налаштувань", "finance:settings")]])
+    text = (
+        "🏷 <b>Категорії витрат</b>\n\n"
+        "Натисніть категорію, щоб змінити її групу:\n"
+        f"{category_list}\n\n"
+        "<i>«Не класифікувати» прибирає категорію лише з груп потреб і бажань. Витрати за нею залишаються в загальних витратах і впливають на залишок доходу.</i>\n\n"
+        "<i>«Залишок доходу» не призначається категоріям — бот рахує його окремо як різницю між надходженнями та витратами.</i>"
+    )
+    return text, keyboard(rows)
+
+
+@router.callback_query(F.data.startswith("finance:category-budget:"))
+async def category_budget_choices(callback: CallbackQuery) -> None:
+    if not await allowed(callback):
+        return
+    try:
+        category_id = int(callback.data.rsplit(":", 1)[1])
+    except (AttributeError, ValueError):
+        await callback.answer("Некоректна категорія.", show_alert=True)
+        return
+    categories = await _db.finance_categories(callback.from_user.id)  # type: ignore[union-attr]
+    category = next((item for item in categories if int(item["id"]) == category_id), None)
+    if not category:
+        await callback.answer("Категорію не знайдено.", show_alert=True)
+        return
+    labels = {"needs": "Потреби", "wants": "Бажання", "exclude": "Не класифікувати"}
+    rows = [
+        [("🧺 Потреби" + (" ✓" if category["budget_group"] == "needs" else ""), f"finance:category-budget-set:{category_id}:needs")],
+        [("✨ Бажання" + (" ✓" if category["budget_group"] == "wants" else ""), f"finance:category-budget-set:{category_id}:wants")],
+        [("⚪ Не класифікувати" + (" ✓" if category["budget_group"] == "exclude" else ""), f"finance:category-budget-set:{category_id}:exclude")],
+        [("← До категорій", "finance:settings:categories")],
+    ]
+    await callback.message.edit_text(
+        f"🏷 <b>{escape(category['name'])}</b>\n\nПоточна група: <b>{labels.get(category['budget_group'], 'Не класифікувати')}</b>\n\n"
+        "Зміна застосовується до підсумків за останні 30 днів і до наступних звітів.",
+        reply_markup=keyboard(rows), parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("finance:category-budget-set:"))
+async def category_budget_set(callback: CallbackQuery) -> None:
+    if not await allowed(callback):
+        return
+    try:
+        prefix, category_id_text, group = callback.data.rsplit(":", 2)
+        if prefix != "finance:category-budget-set":
+            raise ValueError
+        category_id = int(category_id_text)
+        if group not in {"needs", "wants", "exclude"}:
+            raise ValueError
+    except (AttributeError, ValueError):
+        await callback.answer("Некоректні параметри групи.", show_alert=True)
+        return
+    if not await _db.set_finance_category_budget_group(callback.from_user.id, category_id, group):  # type: ignore[union-attr]
+        await callback.answer("Категорію не знайдено.", show_alert=True)
+        return
+    categories = await _db.finance_categories(callback.from_user.id)  # type: ignore[union-attr]
+    text, markup = category_settings_view(categories)
+    await callback.message.edit_text("✅ Групу категорії змінено.\n\n" + text, reply_markup=markup, parse_mode="HTML")
+    await callback.answer("Групу оновлено")
 
 
 @router.callback_query(F.data.startswith("finance:add-category"))

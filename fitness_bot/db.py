@@ -162,9 +162,18 @@ CREATE TABLE IF NOT EXISTS finance_categories (
     telegram_id INTEGER,
     name TEXT NOT NULL,
     kind TEXT NOT NULL DEFAULT 'expense',
+    budget_group TEXT NOT NULL DEFAULT 'exclude',
     mcc_codes TEXT NOT NULL DEFAULT '',
     UNIQUE(telegram_id, name),
     FOREIGN KEY(telegram_id) REFERENCES telegram_accounts(telegram_id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS finance_category_budget_groups (
+    telegram_id INTEGER NOT NULL,
+    category_id INTEGER NOT NULL,
+    budget_group TEXT NOT NULL,
+    PRIMARY KEY(telegram_id, category_id),
+    FOREIGN KEY(telegram_id) REFERENCES telegram_accounts(telegram_id) ON DELETE CASCADE,
+    FOREIGN KEY(category_id) REFERENCES finance_categories(id) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS finance_budgets (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -436,6 +445,10 @@ class Database:
 
     async def _migrate_finance_categories(self) -> None:
         db = self._db()
+        columns = {row[1] for row in await (await db.execute("PRAGMA table_info(finance_categories)")).fetchall()}
+        added_budget_group = "budget_group" not in columns
+        if added_budget_group:
+            await db.execute("ALTER TABLE finance_categories ADD COLUMN budget_group TEXT NOT NULL DEFAULT 'exclude'")
         aliases = {
             "Продукти": "🛒 Продукти",
             "Транспорт": "🚗 Транспорт",
@@ -491,6 +504,16 @@ class Database:
                 "INSERT OR IGNORE INTO finance_categories(telegram_id, name, kind, mcc_codes) VALUES (NULL, ?, 'expense', ?)",
                 (name, mcc_codes),
             )
+        if added_budget_group:
+            needs_markers = ("продукт", "транспорт", "комуналь", "зв'язок", "здоров")
+            wants_markers = ("кафе", "рестора", "розваг", "дозвіл", "покуп", "одяг")
+            categories = await (await db.execute("SELECT id, name FROM finance_categories")).fetchall()
+            for category in categories:
+                name = category["name"].casefold()
+                group = "needs" if any(marker in name for marker in needs_markers) else (
+                    "wants" if any(marker in name for marker in wants_markers) else "exclude"
+                )
+                await db.execute("UPDATE finance_categories SET budget_group=? WHERE id=?", (group, category["id"]))
 
     async def _migrate_finance_transactions(self) -> None:
         columns = {row[1] for row in await (await self._db().execute("PRAGMA table_info(finance_transactions)")).fetchall()}
@@ -984,11 +1007,37 @@ class Database:
         return await self.save_finance_mcc_rule(telegram_id, int(row["mcc"]), category_id)
 
     async def finance_categories(self, telegram_id: int) -> list[aiosqlite.Row]:
-        rows = await (await self._db().execute("SELECT * FROM finance_categories WHERE telegram_id IS NULL OR telegram_id=? ORDER BY telegram_id IS NOT NULL, name, id", (telegram_id,))).fetchall()
+        rows = await (await self._db().execute(
+            "SELECT c.id, c.telegram_id, c.name, c.kind, c.mcc_codes, "
+            "COALESCE(g.budget_group, c.budget_group) AS budget_group "
+            "FROM finance_categories c LEFT JOIN finance_category_budget_groups g "
+            "ON g.category_id=c.id AND g.telegram_id=? "
+            "WHERE c.telegram_id IS NULL OR c.telegram_id=? "
+            "ORDER BY c.telegram_id IS NOT NULL, c.name, c.id",
+            (telegram_id, telegram_id),
+        )).fetchall()
         unique: dict[str, aiosqlite.Row] = {}
         for row in rows:
             unique.setdefault(row["name"].casefold(), row)
         return list(unique.values())
+
+    async def set_finance_category_budget_group(self, telegram_id: int, category_id: int, budget_group: str) -> bool:
+        if budget_group not in {"needs", "wants", "exclude"}:
+            raise ValueError("Невідома група бюджету.")
+        db = self._db()
+        category = await (await db.execute(
+            "SELECT id FROM finance_categories WHERE id=? AND (telegram_id IS NULL OR telegram_id=?)",
+            (category_id, telegram_id),
+        )).fetchone()
+        if not category:
+            return False
+        await db.execute(
+            "INSERT INTO finance_category_budget_groups(telegram_id, category_id, budget_group) VALUES (?, ?, ?) "
+            "ON CONFLICT(telegram_id, category_id) DO UPDATE SET budget_group=excluded.budget_group",
+            (telegram_id, category_id, budget_group),
+        )
+        await db.commit()
+        return True
 
     async def create_finance_category(self, telegram_id: int, name: str) -> int:
         name = " ".join(name.split())[:80]
@@ -1118,7 +1167,12 @@ class Database:
             (telegram_id, start),
         )).fetchall()
         categories = await (await db.execute(
-            "SELECT c.id AS category_id, c.name AS name, t.currency_code, SUM(-t.amount_minor) AS amount FROM finance_transactions t JOIN finance_categories c ON c.id=t.category_id WHERE t.telegram_id=? AND t.amount_minor<0 AND t.occurred_at>=? GROUP BY c.id, c.name, t.currency_code ORDER BY amount DESC",
+            "SELECT c.id AS category_id, c.name AS name, COALESCE(g.budget_group, c.budget_group) AS budget_group, "
+            "t.currency_code, SUM(-t.amount_minor) AS amount "
+            "FROM finance_transactions t JOIN finance_categories c ON c.id=t.category_id "
+            "LEFT JOIN finance_category_budget_groups g ON g.category_id=c.id AND g.telegram_id=t.telegram_id "
+            "WHERE t.telegram_id=? AND t.amount_minor<0 AND t.occurred_at>=? "
+            "GROUP BY c.id, c.name, COALESCE(g.budget_group, c.budget_group), t.currency_code ORDER BY amount DESC",
             (telegram_id, start),
         )).fetchall()
         uncategorized = await (await db.execute("SELECT COUNT(*) AS count FROM finance_transactions WHERE telegram_id=? AND category_id IS NULL AND occurred_at>=?", (telegram_id, start))).fetchone()

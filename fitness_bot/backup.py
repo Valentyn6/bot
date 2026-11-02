@@ -31,7 +31,7 @@ FULL_DATA_TABLES = {
 }
 COUNT_TABLES = {
     "telegram_accounts", "profiles", "food_database", "food_log", "activity_log", "weight_log", "sleep_log",
-    "finance_transactions", "goals", "habits", "habit_logs", "reflection_entries", "weekly_reflections",
+    "finance_transactions", "finance_category_budget_groups", "goals", "habits", "habit_logs", "reflection_entries", "weekly_reflections",
     "training_programs", "training_sessions", "training_exercise_logs",
 }
 
