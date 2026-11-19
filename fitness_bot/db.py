@@ -548,7 +548,8 @@ class Database:
             "LOWER(description) LIKE '%міграції рахунку%' "
             "OR description LIKE '%Поповнення «%' "
             "OR description LIKE '%Часткове зняття банки%' "
-            "OR LOWER(description) LIKE '%виплата банки%')"
+            "OR description LIKE '%Виплата банки%' "
+            "OR description LIKE '%виплата банки%')"
         )
         await self._db().execute("CREATE INDEX IF NOT EXISTS idx_finance_transactions_goal ON finance_transactions(goal_id)")
 

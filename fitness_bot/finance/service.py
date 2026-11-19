@@ -58,16 +58,20 @@ class FinanceService:
             if not isinstance(jar, dict) or not jar.get("id"):
                 continue
             external_id = str(jar["id"])
-            current_ids.append(external_id)
             if jar.get("balance") is None:
+                current_ids.append(external_id)
                 continue
             try:
+                balance_minor = int(jar["balance"])
+                if balance_minor <= 0:
+                    continue
+                current_ids.append(external_id)
                 await self.db.save_finance_jar(
                     telegram_id,
                     monobank_account_id,
                     external_id,
                     str(jar.get("title") or jar.get("name") or "Скарбничка"),
-                    int(jar["balance"]),
+                    balance_minor,
                     int(jar.get("goal", 0) or 0),
                     int(jar.get("currencyCode", 980) or 980),
                 )
