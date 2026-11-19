@@ -136,15 +136,46 @@ def weight_stats(rows: list[Any], target: float | None) -> dict[str, Any]:
     if not rows:
         return {"count": 0}
     first, current = rows[0], rows[-1]
-    elapsed = max((date.fromisoformat(current["log_date"]) - date.fromisoformat(first["log_date"])).days, 1)
     change = current["weight"] - first["weight"]
-    pace = change / elapsed * 7
+    recent_start = local_today() - timedelta(days=29)
+    recent_rows = [row for row in rows if date.fromisoformat(row["log_date"]) >= recent_start]
+    weekly_values: dict[tuple[int, int], list[tuple[date, float]]] = {}
+    for row in recent_rows:
+        log_date = date.fromisoformat(row["log_date"])
+        iso = log_date.isocalendar()
+        weekly_values.setdefault((iso.year, iso.week), []).append((log_date, float(row["weight"])))
+
+    pace: float | None = None
+    if len(recent_rows) >= 3 and len(weekly_values) >= 2:
+        points = [
+            (
+                sum((entry_date - recent_start).days for entry_date, _ in entries) / len(entries),
+                sum(weight for _, weight in entries) / len(entries),
+            )
+            for entries in weekly_values.values()
+        ]
+        mean_x = sum(x for x, _ in points) / len(points)
+        mean_y = sum(y for _, y in points) / len(points)
+        variance_x = sum((x - mean_x) ** 2 for x, _ in points)
+        if variance_x:
+            slope_per_day = sum((x - mean_x) * (y - mean_y) for x, y in points) / variance_x
+            pace = slope_per_day * 7
     eta = "н/д"
-    if abs(pace) >= 0.01 and target is not None:
+    if pace is not None and abs(pace) >= 0.01 and target is not None:
         reached = (pace > 0 and current["weight"] >= target) or (pace < 0 and current["weight"] <= target)
         weeks = (target - current["weight"]) / pace
         eta = "ціль уже досягнута" if reached else (f"{weeks:.1f} тиж." if weeks >= 0 else "темп віддаляє від цілі")
-    return {"count": len(rows), "first": first["weight"], "current": current["weight"], "change": change, "pace": pace, "eta": eta, "last_date": current["log_date"]}
+    return {
+        "count": len(rows),
+        "first": first["weight"],
+        "current": current["weight"],
+        "change": change,
+        "pace": pace,
+        "pace_count": len(recent_rows),
+        "pace_weeks": len(weekly_values),
+        "eta": eta,
+        "last_date": current["log_date"],
+    }
 
 
 def normalize_date(value: str | None) -> str:

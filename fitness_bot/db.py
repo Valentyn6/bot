@@ -547,7 +547,8 @@ class Database:
             "WHERE source='monobank' AND ("
             "LOWER(description) LIKE '%міграції рахунку%' "
             "OR description LIKE '%Поповнення «%' "
-            "OR description LIKE '%Часткове зняття банки%')"
+            "OR description LIKE '%Часткове зняття банки%' "
+            "OR LOWER(description) LIKE '%виплата банки%')"
         )
         await self._db().execute("CREATE INDEX IF NOT EXISTS idx_finance_transactions_goal ON finance_transactions(goal_id)")
 
@@ -1014,6 +1015,24 @@ class Database:
 
     async def finance_jars(self, telegram_id: int) -> list[aiosqlite.Row]:
         return await (await self._db().execute("SELECT fj.*, ma.telegram_id FROM finance_jars fj JOIN monobank_accounts ma ON ma.id=fj.monobank_account_id WHERE ma.telegram_id=? ORDER BY fj.title, fj.id", (telegram_id,))).fetchall()
+
+    async def remove_stale_finance_jars(self, telegram_id: int, monobank_account_id: int, current_external_ids: list[str]) -> None:
+        ownership = await (await self._db().execute(
+            "SELECT id FROM monobank_accounts WHERE id=? AND telegram_id=?",
+            (monobank_account_id, telegram_id),
+        )).fetchone()
+        if not ownership:
+            raise ValueError("Банк Monobank не належить користувачу.")
+        ids = list(dict.fromkeys(str(external_id) for external_id in current_external_ids if external_id))
+        if ids:
+            placeholders = ",".join("?" for _ in ids)
+            await self._db().execute(
+                f"DELETE FROM finance_jars WHERE monobank_account_id=? AND external_id NOT IN ({placeholders})",
+                (monobank_account_id, *ids),
+            )
+        else:
+            await self._db().execute("DELETE FROM finance_jars WHERE monobank_account_id=?", (monobank_account_id,))
+        await self._db().commit()
 
     async def set_finance_account_alias(self, telegram_id: int, account_id: int, alias: str) -> bool:
         cur = await self._db().execute("UPDATE finance_accounts SET alias=? WHERE id=? AND monobank_account_id IN (SELECT id FROM monobank_accounts WHERE telegram_id=?)", (alias.strip() or None, account_id, telegram_id))

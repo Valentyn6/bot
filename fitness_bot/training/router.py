@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from html import escape
 
 from aiogram import BaseMiddleware, F, Router
@@ -468,13 +468,20 @@ async def finish_day(callback: CallbackQuery) -> None:
 
 async def send_progress_chart(callback: CallbackQuery, pid: int, exercise_name: str) -> None:
     conn = db()._db()
-    rows = await (await conn.execute("SELECT s.session_date AS log_date,l.weight FROM training_exercise_logs l JOIN training_sessions s ON s.id=l.session_id WHERE s.profile_id=? AND l.exercise_name=? AND l.weight IS NOT NULL ORDER BY s.session_date", (pid, exercise_name))).fetchall()
+    range_start = (local_today() - timedelta(days=29)).isoformat()
+    rows = await (await conn.execute(
+        "SELECT s.session_date AS log_date,l.weight FROM training_exercise_logs l "
+        "JOIN training_sessions s ON s.id=l.session_id "
+        "WHERE s.profile_id=? AND l.exercise_name=? AND l.weight IS NOT NULL AND s.session_date>=? "
+        "ORDER BY s.session_date",
+        (pid, exercise_name, range_start),
+    )).fetchall()
     if not rows:
-        await callback.answer("Історії поки немає. Позначте тренувальний день виконаним.", show_alert=True)
+        await callback.answer("За останні 30 днів історії немає. Позначте тренувальний день виконаним.", show_alert=True)
         return
     path = exercise_progress_chart(rows, exercise_name)
     try:
-        await callback.message.answer_photo(BufferedInputFile(path.read_bytes(), filename="exercise-progress.png"), caption=f"📈 Прогрес: {exercise_name}")
+        await callback.message.answer_photo(BufferedInputFile(path.read_bytes(), filename="exercise-progress.png"), caption=f"📈 Прогрес за 30 днів: {exercise_name}")
     finally:
         path.unlink(missing_ok=True)
     await callback.answer()

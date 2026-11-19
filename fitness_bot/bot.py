@@ -2126,7 +2126,22 @@ async def weight_callback(callback: CallbackQuery) -> None:
     else:
         rows = await db.weights(profile["id"])
         stats = weight_stats(rows, profile["target_weight"])
-        text = "⚖️ Історія ваги\n" + (f"Поточна: {stats['current']} кг · Перша: {stats['first']} кг · Зміна: {stats['change']:+.1f} кг\nТемп: {stats['pace']:+.2f} кг/тиждень · До цілі: {stats['eta']}\nВимірювань: {stats['count']} · Остання дата: {stats['last_date']}" if rows else "Даних ще немає.")
+        if rows:
+            pace = stats["pace"]
+            pace_text = (
+                f"{pace:+.2f} кг/тиждень"
+                if pace is not None
+                else "недостатньо даних (потрібно 3+ вимірювання у 2+ тижнях)"
+            )
+            text = (
+                "⚖️ Історія ваги\n"
+                f"Поточна: {stats['current']} кг · Перша: {stats['first']} кг\n"
+                f"Зміна за весь період: {stats['change']:+.1f} кг\n"
+                f"Поточний темп за 30 днів: {pace_text} · До цілі: {stats['eta']}\n"
+                f"Вимірювань: {stats['count']} · Остання дата: {stats['last_date']}"
+            )
+        else:
+            text = "⚖️ Історія ваги\nДаних ще немає."
     await callback.message.edit_text(text, reply_markup=buttons([[('➕ Записати вагу', 'weight_add')], [('← До спорту і раціону', 'sport:menu')]]))
     await callback.answer()
 
@@ -2457,10 +2472,11 @@ async def charts_callback(callback: CallbackQuery) -> None:
         await callback.message.edit_text("📈 Графіки недоступні в ручному режимі: немає часового ряду імпортованих даних.", reply_markup=nav())
         await callback.answer()
         return
-    weights = await db.weights(profile["id"])
-    activities = await db.activities(profile["id"])
+    range_start = (local_today() - timedelta(days=29)).isoformat()
+    weights = [row for row in await db.weights(profile["id"]) if row["log_date"] >= range_start]
+    activities = await db.activities(profile["id"], days=30)
     if not weights and not activities:
-        await callback.message.edit_text("📈 Для графіків потрібні імпортовані дані.", reply_markup=nav())
+        await callback.message.edit_text("📈 За останні 30 днів даних для графіків немає.", reply_markup=nav())
         await callback.answer()
         return
     options = []
@@ -2470,11 +2486,10 @@ async def charts_callback(callback: CallbackQuery) -> None:
         options.extend([
             [("👣 Кроки", "charts:steps")],
             [("🔥 Активні калорії", "charts:active_calories")],
-            [("🏋️ Калорії тренувань", "charts:workout_calories")],
             [("📏 Дистанція", "charts:distance")],
         ])
     options.append([("← До спорту і раціону", "sport:menu")])
-    await callback.message.edit_text("📈 <b>Графіки</b>\n\nОберіть показник:", reply_markup=buttons(options), parse_mode="HTML")
+    await callback.message.edit_text("📈 <b>Графіки · останні 30 днів</b>\n\nОберіть показник:", reply_markup=buttons(options), parse_mode="HTML")
     await callback.answer()
 
 
@@ -2484,31 +2499,31 @@ async def chart_selected(callback: CallbackQuery) -> None:
         return
     profile = await account_profile(callback.from_user.id)
     field = callback.data.split(":", 1)[1]
+    range_start = (local_today() - timedelta(days=29)).isoformat()
     if field == "weight":
-        rows = await db.weights(profile["id"])
+        rows = [row for row in await db.weights(profile["id"]) if row["log_date"] >= range_start]
         if not rows:
-            await callback.answer("Записів ваги ще немає.", show_alert=True)
+            await callback.answer("За останні 30 днів записів ваги немає.", show_alert=True)
             return
         path = weight_chart(rows)
-        title = "⚖️ Графік ваги"
+        title = "⚖️ Графік ваги · останні 30 днів"
         filename = "weight.png"
     else:
         chart_fields = {
             "steps": ("Кроки", "кроків"),
             "active_calories": ("Активні калорії", "ккал"),
-            "workout_calories": ("Калорії тренувань", "ккал"),
             "distance": ("Дистанція", "км"),
         }
         if field not in chart_fields:
             await callback.answer("Невідомий показник.", show_alert=True)
             return
-        rows = await db.activities(profile["id"])
+        rows = await db.activities(profile["id"], days=30)
         if not rows:
-            await callback.answer("Даних активності ще немає.", show_alert=True)
+            await callback.answer("За останні 30 днів даних активності немає.", show_alert=True)
             return
         chart_title, unit = chart_fields[field]
         path = activity_chart(rows, field, chart_title, unit)
-        title = f"🏃 Графік: {chart_title.casefold()}"
+        title = f"🏃 Графік: {chart_title.casefold()} · останні 30 днів"
         filename = f"{field}.png"
     try:
         await callback.message.answer_document(BufferedInputFile(path.read_bytes(), filename=filename), caption=title)

@@ -16,6 +16,7 @@ def is_internal_transfer(description: str) -> bool:
         "в рамках міграції рахунку" in normalized
         or "поповнення «" in normalized
         or "часткове зняття банки" in normalized
+        or "виплата банки" in normalized
     )
 
 
@@ -47,6 +48,32 @@ class FinanceService:
         if not isinstance(info, dict):
             raise ValueError("Monobank повернув некоректні дані.")
         return await self._cache_account_info(telegram_id, stored, info)
+
+    async def _sync_jars(self, telegram_id: int, monobank_account_id: int, raw_jars: Any) -> None:
+        if not isinstance(raw_jars, list):
+            logger.warning("Monobank client-info jars has unexpected type: %s; keeping cached jars", type(raw_jars).__name__)
+            return
+        current_ids = []
+        for jar in raw_jars:
+            if not isinstance(jar, dict) or not jar.get("id"):
+                continue
+            external_id = str(jar["id"])
+            current_ids.append(external_id)
+            if jar.get("balance") is None:
+                continue
+            try:
+                await self.db.save_finance_jar(
+                    telegram_id,
+                    monobank_account_id,
+                    external_id,
+                    str(jar.get("title") or jar.get("name") or "Скарбничка"),
+                    int(jar["balance"]),
+                    int(jar.get("goal", 0) or 0),
+                    int(jar.get("currencyCode", 980) or 980),
+                )
+            except (TypeError, ValueError):
+                logger.warning("Skipping invalid Monobank jar data for %s", external_id)
+        await self.db.remove_stale_finance_jars(telegram_id, monobank_account_id, current_ids)
 
     async def _cache_account_info(self, telegram_id: int, stored: Any, info: dict[str, Any]) -> dict[str, Any]:
         cached = {row["external_id"]: row for row in await self.db.finance_accounts(telegram_id)}
@@ -82,25 +109,10 @@ class FinanceService:
                 balance,
             )
             accounts.append(account)
-        raw_jars = info.get("jars", [])
+        raw_jars = info.get("jars")
+        await self._sync_jars(telegram_id, stored["id"], raw_jars)
         if not isinstance(raw_jars, list):
-            logger.warning("Monobank client-info jars has unexpected type: %s; treating it as empty", type(raw_jars).__name__)
             raw_jars = []
-        for jar in raw_jars:
-            if not isinstance(jar, dict) or not jar.get("id") or jar.get("balance") is None:
-                continue
-            try:
-                await self.db.save_finance_jar(
-                    telegram_id,
-                    stored["id"],
-                    str(jar["id"]),
-                    str(jar.get("title") or jar.get("name") or "Скарбничка"),
-                    int(jar["balance"]),
-                    int(jar.get("goal", 0) or 0),
-                    int(jar.get("currencyCode", 980) or 980),
-                )
-            except (TypeError, ValueError):
-                continue
         return {**info, "accounts": accounts, "jars": raw_jars}
 
     async def _cached_account_info(self, telegram_id: int, stored: Any) -> dict[str, Any]:
@@ -180,22 +192,8 @@ class FinanceService:
                     },
                 )
                 imported += int(saved is not None)
-        raw_jars = info.get("jars", [])
-        if not isinstance(raw_jars, list):
-            raw_jars = []
-        for jar in raw_jars:
-            jar_id = str(jar.get("id", ""))
-            if not jar_id:
-                continue
-            await self.db.save_finance_jar(
-                telegram_id,
-                stored["id"],
-                jar_id,
-                str(jar.get("title") or jar.get("name") or "Скарбничка"),
-                int(jar.get("balance", 0) or 0),
-                int(jar.get("goal", 0) or 0),
-                int(jar.get("currencyCode", 980) or 980),
-            )
+        raw_jars = info.get("jars")
+        await self._sync_jars(telegram_id, stored["id"], raw_jars)
         return imported
 
     async def dashboard(self, telegram_id: int) -> dict[str, Any]:
