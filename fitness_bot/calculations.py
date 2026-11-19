@@ -162,7 +162,10 @@ def weight_stats(rows: list[Any], target: float | None) -> dict[str, Any]:
             pace = slope_per_day * 7
     eta = "н/д"
     if pace is not None and abs(pace) >= 0.01 and target is not None:
-        reached = (pace > 0 and current["weight"] >= target) or (pace < 0 and current["weight"] <= target)
+        reached = (
+            (target >= first["weight"] and current["weight"] >= target)
+            or (target < first["weight"] and current["weight"] <= target)
+        )
         weeks = (target - current["weight"]) / pace
         eta = "ціль уже досягнута" if reached else (f"{weeks:.1f} тиж." if weeks >= 0 else "темп віддаляє від цілі")
     return {
