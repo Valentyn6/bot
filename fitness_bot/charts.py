@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from textwrap import shorten
+from textwrap import fill
 from typing import Any
 
 import matplotlib
@@ -42,22 +42,19 @@ def expense_category_chart(rows: list[dict[str, Any]], currency_code: int, perio
     symbols = {980: "₴", 840: "$", 978: "€", 826: "£"}
     symbol = symbols.get(int(currency_code), f"{currency_code}")
     ranked = sorted(
-        ((shorten(str(row["name"]), width=34, placeholder="…"), int(row["amount"])) for row in rows if int(row["amount"]) > 0),
+        ((str(row["name"]), int(row["amount"])) for row in rows if int(row["amount"]) > 0),
         key=lambda row: row[1],
         reverse=True,
     )
-    if len(ranked) > 5:
-        ranked = ranked[:5] + [("Інше", sum(amount for _, amount in ranked[5:]))]
     ranked.reverse()
 
     handle = NamedTemporaryFile(prefix="finance_expenses_", suffix=".png", delete=False)
     path = Path(handle.name)
     handle.close()
-    fig, axis = plt.subplots(figsize=(9, max(3.8, 0.62 * len(ranked) + 1.6)))
-    labels = [name for name, _ in ranked]
+    fig, axis = plt.subplots(figsize=(10, max(4.5, 0.62 * len(ranked) + 1.6)))
+    labels = [fill(name, width=28) for name, _ in ranked]
     values = [amount / 100 for _, amount in ranked]
-    colors = ["#176b87" if label != "Інше" else "#9bb6c1" for label in labels]
-    bars = axis.barh(range(len(ranked)), values, color=colors, height=0.64)
+    bars = axis.barh(range(len(ranked)), values, color="#176b87", height=0.64)
     max_value = max(values, default=0)
     axis.set_yticks(range(len(ranked)), labels)
     axis.set_xlim(0, max_value * 1.38 if max_value else 1)
