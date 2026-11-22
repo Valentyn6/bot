@@ -5,9 +5,10 @@ from html import escape
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from ..calculations import parse_number
+from ..charts import expense_category_chart
 from ..db import Database
 from .service import FinanceService
 from .states import BudgetFlow, CardAliasFlow, CashFlow, CustomCategoryFlow, FinanceTokenFlow
@@ -52,6 +53,7 @@ def dashboard_menu(uncategorized: int = 0) -> InlineKeyboardMarkup:
         [("🔄 Синхронізувати Monobank", "finance:sync")],
         [("💳 Рахунки", "finance:accounts"), ("📋 Операції", "finance:transactions")],
         [("📊 Динаміка", "finance:comparison")],
+        [("📊 Діаграма витрат", "finance:spending-chart")],
         [("➕ Готівкова витрата", "finance:cash")],
         [("🔁 Повторити витрату", "finance:repeat-cash")],
         [("⚙️ Налаштування фінансів", "finance:settings")],
@@ -288,6 +290,7 @@ async def finance_menu(callback: CallbackQuery) -> None:
                 [('🔑 Підключити Monobank', 'finance:bank:mono')],
                 [('➕ Готівкова витрата', 'finance:cash')],
                 [('🔁 Повторити витрату', 'finance:repeat-cash')],
+                [('📊 Діаграма витрат', 'finance:spending-chart')],
                 [('← Головне меню', 'home')],
             ]),
             parse_mode="HTML",
@@ -439,6 +442,77 @@ async def comparison(callback: CallbackQuery) -> None:
         return
     await callback.message.edit_text(comparison_text(data), reply_markup=keyboard([[('← До dashboard', 'finance:menu')]]), parse_mode="HTML")
     await callback.answer()
+
+
+def spending_chart_groups(summary: dict) -> dict[int, list[dict[str, int | str]]]:
+    grouped: dict[int, dict[str, int]] = {}
+    for row in summary.get("categories", []):
+        code = int(row_value(row, "currency_code", 980))
+        name = str(row["name"])
+        grouped.setdefault(code, {})[name] = grouped.setdefault(code, {}).get(name, 0) + int(row["amount"])
+    for row in summary.get("uncategorized_amounts", []):
+        code = int(row["currency_code"])
+        grouped.setdefault(code, {})["Без категорії"] = grouped.setdefault(code, {}).get("Без категорії", 0) + int(row["amount"])
+    return {
+        code: [{"name": name, "amount": amount} for name, amount in amounts.items() if amount > 0]
+        for code, amounts in grouped.items()
+        if any(amount > 0 for amount in amounts.values())
+    }
+
+
+async def show_spending_chart(callback: CallbackQuery, currency_code: int, groups: dict[int, list[dict[str, int | str]]]) -> None:
+    rows = groups.get(currency_code)
+    if not rows:
+        await callback.answer("За цей місяць витрат у вибраній валюті немає.", show_alert=True)
+        return
+    path = expense_category_chart(rows, currency_code, "поточний місяць")
+    try:
+        await callback.message.answer_photo(
+            BufferedInputFile(path.read_bytes(), filename=f"expenses_{currency_code}.png"),
+            caption=f"📊 Витрати за поточний місяць · {currency_label(currency_code)}",
+        )
+    finally:
+        path.unlink(missing_ok=True)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "finance:spending-chart")
+async def spending_chart(callback: CallbackQuery) -> None:
+    if not await allowed(callback):
+        return
+    summary = await _db.finance_summary(callback.from_user.id, calendar_month=True)  # type: ignore[union-attr]
+    groups = spending_chart_groups(summary)
+    if not groups:
+        await callback.answer("За поточний місяць витрат ще немає.", show_alert=True)
+        return
+    if len(groups) == 1:
+        await show_spending_chart(callback, next(iter(groups)), groups)
+        return
+    rows = [[(currency_label(code), f"finance:spending-chart:{code}")] for code in sorted(groups)]
+    rows.append([("← До фінансів", "finance:menu")])
+    await callback.message.edit_text(
+        "📊 <b>Діаграма витрат</b>\n\nОберіть валюту. Валюти показуються окремо, без конвертації.",
+        reply_markup=keyboard(rows),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("finance:spending-chart:"))
+async def spending_chart_currency(callback: CallbackQuery) -> None:
+    if not await allowed(callback):
+        return
+    try:
+        currency_code = int(callback.data.rsplit(":", 1)[1])
+    except (AttributeError, ValueError):
+        await callback.answer("Некоректна валюта.", show_alert=True)
+        return
+    summary = await _db.finance_summary(callback.from_user.id, calendar_month=True)  # type: ignore[union-attr]
+    groups = spending_chart_groups(summary)
+    if currency_code not in groups:
+        await callback.answer("Для цієї валюти витрат не знайдено.", show_alert=True)
+        return
+    await show_spending_chart(callback, currency_code, groups)
 
 
 async def show_uncategorized(callback: CallbackQuery) -> None:

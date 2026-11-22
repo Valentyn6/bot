@@ -1258,6 +1258,12 @@ class Database:
             (telegram_id, *period_params),
         )).fetchall()
         uncategorized = await (await db.execute(f"SELECT COUNT(*) AS count FROM finance_transactions WHERE telegram_id=? AND is_internal_transfer=0 AND category_id IS NULL AND {period_filter}", (telegram_id, *period_params))).fetchone()
+        uncategorized_amounts = await (await db.execute(
+            f"SELECT currency_code, SUM(-amount_minor) AS amount FROM finance_transactions "
+            f"WHERE telegram_id=? AND is_internal_transfer=0 AND category_id IS NULL AND amount_minor<0 AND {period_filter} "
+            "GROUP BY currency_code ORDER BY currency_code",
+            (telegram_id, *period_params),
+        )).fetchall()
         logger.debug(
             "Finance summary user=%s start=%s categories=%s uncategorized=%s",
             telegram_id,
@@ -1265,7 +1271,7 @@ class Database:
             [dict(row) for row in categories],
             uncategorized["count"],
         )
-        return {"income": totals["income"], "expenses": totals["expenses"], "currency_totals": currency_totals, "internal_transfer_totals": internal_transfer_totals, "categories": categories, "top_categories": categories[:3], "uncategorized": uncategorized["count"]}
+        return {"income": totals["income"], "expenses": totals["expenses"], "currency_totals": currency_totals, "internal_transfer_totals": internal_transfer_totals, "categories": categories, "top_categories": categories[:3], "uncategorized": uncategorized["count"], "uncategorized_amounts": uncategorized_amounts}
 
     async def previous_month_income(self, telegram_id: int) -> int:
         today = local_today()
