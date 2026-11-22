@@ -5,10 +5,11 @@ from html import escape
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
-from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from ..calculations import parse_number
 from ..charts import expense_category_chart
+from ..chart_delivery import send_graph
 from ..db import Database
 from .service import FinanceService
 from .states import BudgetFlow, CardAliasFlow, CashFlow, CustomCategoryFlow, FinanceTokenFlow
@@ -460,16 +461,20 @@ def spending_chart_groups(summary: dict) -> dict[int, list[dict[str, int | str]]
     }
 
 
-async def show_spending_chart(callback: CallbackQuery, currency_code: int, groups: dict[int, list[dict[str, int | str]]]) -> None:
+async def show_spending_chart(callback: CallbackQuery, state: FSMContext, currency_code: int, groups: dict[int, list[dict[str, int | str]]]) -> None:
     rows = groups.get(currency_code)
     if not rows:
         await callback.answer("За цей місяць витрат у вибраній валюті немає.", show_alert=True)
         return
     path = expense_category_chart(rows, currency_code, "поточний місяць")
     try:
-        await callback.message.answer_photo(
-            BufferedInputFile(path.read_bytes(), filename=f"expenses_{currency_code}.png"),
-            caption=f"📊 Витрати за поточний місяць · {currency_label(currency_code)}",
+        await send_graph(
+            callback,
+            state,
+            path,
+            f"expenses_{currency_code}.png",
+            f"📊 Витрати за поточний місяць · {currency_label(currency_code)}",
+            as_photo=True,
         )
     finally:
         path.unlink(missing_ok=True)
@@ -477,7 +482,7 @@ async def show_spending_chart(callback: CallbackQuery, currency_code: int, group
 
 
 @router.callback_query(F.data == "finance:spending-chart")
-async def spending_chart(callback: CallbackQuery) -> None:
+async def spending_chart(callback: CallbackQuery, state: FSMContext) -> None:
     if not await allowed(callback):
         return
     summary = await _db.finance_summary(callback.from_user.id, calendar_month=True)  # type: ignore[union-attr]
@@ -486,7 +491,7 @@ async def spending_chart(callback: CallbackQuery) -> None:
         await callback.answer("За поточний місяць витрат ще немає.", show_alert=True)
         return
     if len(groups) == 1:
-        await show_spending_chart(callback, next(iter(groups)), groups)
+        await show_spending_chart(callback, state, next(iter(groups)), groups)
         return
     rows = [[(currency_label(code), f"finance:spending-chart:{code}")] for code in sorted(groups)]
     rows.append([("← До фінансів", "finance:menu")])
@@ -499,7 +504,7 @@ async def spending_chart(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data.startswith("finance:spending-chart:"))
-async def spending_chart_currency(callback: CallbackQuery) -> None:
+async def spending_chart_currency(callback: CallbackQuery, state: FSMContext) -> None:
     if not await allowed(callback):
         return
     try:
@@ -512,7 +517,7 @@ async def spending_chart_currency(callback: CallbackQuery) -> None:
     if currency_code not in groups:
         await callback.answer("Для цієї валюти витрат не знайдено.", show_alert=True)
         return
-    await show_spending_chart(callback, currency_code, groups)
+    await show_spending_chart(callback, state, currency_code, groups)
 
 
 async def show_uncategorized(callback: CallbackQuery) -> None:

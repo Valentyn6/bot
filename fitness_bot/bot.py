@@ -25,6 +25,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from .calculations import calculate_targets, food_totals, is_profile_training_day, is_training_day, normalize_date, parse_number, weekly_activity, weekly_activity_by_day_type, weight_stats
 from .charts import activity_chart, weight_chart
+from .chart_delivery import send_graph
 from .config import Settings
 from .db import Database
 from .backup import BackupError, make_backup_archive, read_backup_archive
@@ -2494,7 +2495,7 @@ async def charts_callback(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data.startswith("charts:"))
-async def chart_selected(callback: CallbackQuery) -> None:
+async def chart_selected(callback: CallbackQuery, state: FSMContext) -> None:
     if await access_denied(callback):
         return
     profile = await account_profile(callback.from_user.id)
@@ -2526,7 +2527,7 @@ async def chart_selected(callback: CallbackQuery) -> None:
         title = f"🏃 Графік: {chart_title.casefold()} · останні 30 днів"
         filename = f"{field}.png"
     try:
-        await callback.message.answer_document(BufferedInputFile(path.read_bytes(), filename=filename), caption=title)
+        await send_graph(callback, state, path, filename, title)
     finally:
         path.unlink(missing_ok=True)
     await callback.answer()

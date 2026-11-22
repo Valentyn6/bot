@@ -6,10 +6,11 @@ from html import escape
 from aiogram import BaseMiddleware, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
-from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from ..calculations import parse_number
 from ..charts import exercise_progress_chart
+from ..chart_delivery import send_graph
 from ..db import Database
 from ..time_utils import local_today
 from .states import TrainingFlow
@@ -466,7 +467,7 @@ async def finish_day(callback: CallbackQuery) -> None:
     await show(callback)
 
 
-async def send_progress_chart(callback: CallbackQuery, pid: int, exercise_name: str) -> None:
+async def send_progress_chart(callback: CallbackQuery, state: FSMContext, pid: int, exercise_name: str) -> None:
     conn = db()._db()
     range_start = (local_today() - timedelta(days=29)).isoformat()
     rows = await (await conn.execute(
@@ -481,7 +482,7 @@ async def send_progress_chart(callback: CallbackQuery, pid: int, exercise_name: 
         return
     path = exercise_progress_chart(rows, exercise_name)
     try:
-        await callback.message.answer_photo(BufferedInputFile(path.read_bytes(), filename="exercise-progress.png"), caption=f"📈 Прогрес за 30 днів: {exercise_name}")
+        await send_graph(callback, state, path, "exercise-progress.png", f"📈 Прогрес за 30 днів: {exercise_name}", as_photo=True)
     finally:
         path.unlink(missing_ok=True)
     await callback.answer()
@@ -506,17 +507,17 @@ async def progress_history(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data.startswith("training:history-chart:"))
-async def history_chart(callback: CallbackQuery) -> None:
+async def history_chart(callback: CallbackQuery, state: FSMContext) -> None:
     exercise_id = int(callback.data.rsplit(":", 1)[1])
     row = await (await db()._db().execute("SELECT name FROM training_exercises WHERE id=? AND (owner_telegram_id IS NULL OR owner_telegram_id=?)", (exercise_id, callback.from_user.id))).fetchone()
     if not row:
         await callback.answer("Вправу не знайдено.", show_alert=True)
         return
-    await send_progress_chart(callback, await profile_id(callback.from_user.id), row["name"])
+    await send_progress_chart(callback, state, await profile_id(callback.from_user.id), row["name"])
 
 
 @router.callback_query(F.data.startswith("training:history-chart-by-name:"))
-async def current_exercise_chart(callback: CallbackQuery) -> None:
+async def current_exercise_chart(callback: CallbackQuery, state: FSMContext) -> None:
     exercise_id = int(callback.data.rsplit(":", 1)[1])
     pid = await profile_id(callback.from_user.id)
     exercise = await (await db()._db().execute(
@@ -527,7 +528,7 @@ async def current_exercise_chart(callback: CallbackQuery) -> None:
     if not exercise:
         await callback.answer("Вправу не знайдено.", show_alert=True)
         return
-    await send_progress_chart(callback, pid, exercise["name_snapshot"])
+    await send_progress_chart(callback, state, pid, exercise["name_snapshot"])
 
 
 @router.callback_query(F.data.startswith("training:remove-ex:"))
