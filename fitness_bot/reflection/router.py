@@ -25,6 +25,11 @@ DAILY_STEPS = (
     ("self_care", "Що ти сьогодні зробив/зробила для себе?", "text"),
     ("tomorrow", "Що хотілося б узяти із собою в завтрашній день?", "text"),
 )
+DAILY_QUICK_STEPS = (
+    ("mood", "Як би ти оцінив/оцінила свій настрій сьогодні?", "rating"),
+    ("energy", "Скільки в тебе сьогодні було енергії?", "rating"),
+    ("good", "Що сьогодні було важливим або хорошим для тебе?", "text"),
+)
 WEEKLY_STEPS = (
     ("energy_sources", "Що давало тобі сили цього тижня?", "text"),
     ("patterns", "Яку повторювану тему або закономірність ти помітив/помітила?", "text"),
@@ -52,9 +57,9 @@ def buttons(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
 
 
 def main_markup(has_today: bool) -> InlineKeyboardMarkup:
-    write_label = "✏️ Змінити запис за сьогодні" if has_today else "🪞 Записати про сьогодні"
     return buttons([
-        [(write_label, "reflection:write")],
+        [("✏️ Оновити запис коротко" if has_today else "🪞 Коротко записати про сьогодні", "reflection:write")],
+        [("✏️ Оновити розгорнуту рефлексію" if has_today else "📝 Розгорнута рефлексія", "reflection:write-full")],
         [("📊 Огляд і рефлексія за тиждень", "reflection:week")],
         [("📚 Попередні записи", "reflection:history")],
         [("← Головне меню", "home")],
@@ -108,6 +113,12 @@ def weekly_report_text(entries, week_start: date, period_end: date, review=None)
         "",
         "<b>Дні з записами</b>",
     ]
+    observations = []
+    for label, values in (("Настрій", mood_values), ("Енергія", energy_values)):
+        if len(values) >= 4:
+            high = sum(value >= 4 for value in values)
+            low = sum(value <= 2 for value in values)
+            observations.append(f"{label}: оцінка 4–5 у {high}/{len(values)} днів; 1–2 у {low}/{len(values)}.")
     if entries:
         for offset in range((period_end - week_start).days + 1):
             day = week_start + timedelta(days=offset)
@@ -119,6 +130,9 @@ def weekly_report_text(entries, week_start: date, period_end: date, review=None)
             lines.append(f"• {WEEKDAYS[day.weekday()]} {day.strftime('%d.%m')} · {mood} · {energy}")
     else:
         lines.append("Поки немає записів за цей тиждень.")
+    if observations:
+        lines.extend(("", "📌 <b>Спостереження за оцінками</b>", *observations))
+        lines.append("Це опис записів, а не пояснення причин.")
     if review:
         sections = (
             ("Що давало сили", review["energy_sources"]),
@@ -249,20 +263,27 @@ async def reflection_week_view(callback: CallbackQuery, state: FSMContext) -> No
     await callback.answer()
 
 
-def _steps(kind: str):
-    return DAILY_STEPS if kind == "daily" else WEEKLY_STEPS
+def _steps(kind: str, expanded: bool = False):
+    if kind == "daily":
+        return DAILY_STEPS if expanded else DAILY_QUICK_STEPS
+    return WEEKLY_STEPS
 
 
 async def _prompt(message: Message, state: FSMContext, index: int, edit: bool = False) -> None:
     data = await state.get_data()
-    steps = _steps(data["kind"])
+    steps = _steps(data["kind"], data.get("expanded", False))
     key, question, step_type = steps[index]
     if data["kind"] == "daily":
         day_label = date.fromisoformat(data["period_key"]).strftime("%d.%m.%Y")
         header = f"🪞 <b>Рефлексія · {day_label}</b>"
         warning = ""
         if index == 0:
-            warning = "\nПісля завершення пропущені поля буде очищено. Якщо скасувати, попередній запис залишиться." if data["had_existing"] else "\nНезаповнені поля залишаться порожніми."
+            if data["had_existing"] and not data.get("expanded", False):
+                warning = "\nІнші відповіді з розгорнутого запису залишаться без змін. Якщо пропустити поле цього короткого запису, його попереднє значення буде очищено."
+            elif data["had_existing"]:
+                warning = "\nПісля завершення пропущені поля буде очищено. Якщо скасувати, попередній запис залишиться."
+            else:
+                warning = "\nНезаповнені поля залишаться порожніми."
     else:
         start = date.fromisoformat(data["period_key"])
         header = f"🪞 <b>Підсумок тижня · від {start.strftime('%d.%m.%Y')}</b>"
@@ -301,11 +322,19 @@ async def _start_flow(callback: CallbackQuery, state: FSMContext, kind: str) -> 
         else await _database().weekly_reflection(callback.from_user.id, period_key)
     )
     await state.set_state(ReflectionFlow.answer)
+    preserve_answers = {}
+    if kind == "daily" and existing:
+        preserve_answers = {
+            key: existing[key]
+            for key in ("good", "challenge", "self_care", "tomorrow", "mood", "energy")
+        }
+    expanded = bool(kind == "daily" and callback.data == "reflection:write-full")
     await state.update_data(
         kind=kind,
+        expanded=expanded,
         period_key=period_key,
         had_existing=bool(existing),
-        answers={},
+        answers=preserve_answers if not expanded else {},
         index=0,
         chat_id=callback.message.chat.id,
         prompt_message_id=callback.message.message_id,
@@ -343,12 +372,13 @@ async def _complete_flow(message: Message, state: FSMContext, telegram_id: int, 
 async def _advance(callback: CallbackQuery, state: FSMContext, answer) -> None:
     data = await state.get_data()
     step_index = int(data["index"])
-    step_key = _steps(data["kind"])[step_index][0]
+    steps = _steps(data["kind"], data.get("expanded", False))
+    step_key = steps[step_index][0]
     answers = dict(data["answers"])
     answers[step_key] = answer
     index = step_index + 1
     await state.update_data(answers=answers, index=index)
-    if index < len(_steps(data["kind"])):
+    if index < len(steps):
         await _prompt(callback.message, state, index, edit=True)
     else:
         await _complete_flow(callback.message, state, callback.from_user.id, {**data, "answers": answers})
@@ -357,6 +387,12 @@ async def _advance(callback: CallbackQuery, state: FSMContext, answer) -> None:
 
 @router.callback_query(F.data == "reflection:write")
 async def reflection_write(callback: CallbackQuery, state: FSMContext) -> None:
+    if await _allowed(callback):
+        await _start_flow(callback, state, "daily")
+
+
+@router.callback_query(F.data == "reflection:write-full")
+async def reflection_write_full(callback: CallbackQuery, state: FSMContext) -> None:
     if await _allowed(callback):
         await _start_flow(callback, state, "daily")
 
@@ -378,7 +414,7 @@ async def reflection_rate(callback: CallbackQuery, state: FSMContext) -> None:
     except (IndexError, ValueError):
         await callback.answer("Оцінку не вдалося зчитати.", show_alert=True)
         return
-    steps = _steps(data.get("kind", ""))
+    steps = _steps(data.get("kind", ""), data.get("expanded", False))
     if index != data.get("index") or not 1 <= rating <= 5 or index >= len(steps) or steps[index][2] != "rating":
         await callback.answer("Цей крок уже завершено.")
         return
@@ -398,7 +434,7 @@ async def reflection_skip(callback: CallbackQuery, state: FSMContext) -> None:
     if index != data.get("index"):
         await callback.answer("Цей крок уже завершено.")
         return
-    await _advance(callback, state, None if _steps(data["kind"])[index][2] == "rating" else "")
+    await _advance(callback, state, None if _steps(data["kind"], data.get("expanded", False))[index][2] == "rating" else "")
 
 
 @router.callback_query(F.data == "reflection:cancel")
@@ -421,7 +457,7 @@ async def reflection_answer(message: Message, state: FSMContext) -> None:
         return
     data = await state.get_data()
     index = int(data["index"])
-    steps = _steps(data["kind"])
+    steps = _steps(data["kind"], data.get("expanded", False))
     if index >= len(steps) or steps[index][2] != "text":
         await message.answer("Спочатку обери оцінку кнопкою або пропусти цей крок.")
         return
