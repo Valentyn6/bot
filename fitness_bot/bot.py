@@ -913,9 +913,20 @@ async def backup_center_text() -> str:
         status = f"Розклад: {freq} о {schedule['send_time']} за Києвом."
     last = schedule["last_success_at"]
     if last:
-        status += f"\nОстання успішна копія: {last}."
+        try:
+            last_display = datetime.fromisoformat(last).astimezone(APP_TIMEZONE).strftime("%d.%m.%Y о %H:%M")
+        except (TypeError, ValueError):
+            last_display = str(last)
+        status += f"\nОстання успішна копія: {last_display} за Києвом."
+    else:
+        status += "\nУспішних резервних копій ще немає."
     if schedule["last_error"]:
-        status += "\n⚠️ Остання спроба завершилася помилкою; бот повторить її пізніше."
+        attempt = schedule["last_attempt_at"]
+        try:
+            attempt_display = datetime.fromisoformat(attempt).astimezone(APP_TIMEZONE).strftime("%d.%m.%Y о %H:%M") if attempt else None
+        except (TypeError, ValueError):
+            attempt_display = str(attempt) if attempt else None
+        status += "\n⚠️ Остання автоматична спроба завершилася помилкою" + (f" ({attempt_display})" if attempt_display else "") + "."
     key_status = "налаштований" if backup_key_ready() else "не налаштований"
     return (
         "🗄 <b>Резервні копії</b>\n\n"
@@ -942,6 +953,7 @@ async def send_database_backup(target: Message, *, automatic: bool = False) -> N
     stamp = now.strftime("%Y%m%d_%H%M")
     caption = "🗄 Зашифрована повна копія бази. Для відновлення потрібен BACKUP_ENCRYPTION_KEY."
     await target.answer_document(BufferedInputFile(archive, filename=f"fitness_bot_backup_{stamp}.fbackup"), caption=caption)
+    await db.record_manual_backup_success()
 
 
 @router.message(Command("export"))
@@ -1131,6 +1143,8 @@ async def backup_create_callback(callback: CallbackQuery) -> None:
         await send_database_backup(callback.message)
     except BackupError as exc:
         await callback.message.answer(str(exc))
+    else:
+        await callback.message.edit_text(await backup_center_text(), reply_markup=backup_center_markup(None), parse_mode="HTML")
     await callback.answer("Копію підготовлено")
 
 

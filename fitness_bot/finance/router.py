@@ -212,11 +212,17 @@ def dashboard_text(data: dict) -> str:
             f"  Різниця: <b>{'+' if net >= 0 else '−'}{money(abs(net), code)}</b>"
         )
     flow_text = "\n".join(flow_lines) if flow_lines else f"Операцій за {period_label} немає."
+    internal_count = int(summary.get("internal_transfer_count", 0))
+    internal_text = (
+        f"\n↔ <b>Внутрішні перекази:</b> {internal_count} · не входять у доходи та витрати.\n"
+        if internal_count
+        else "\n"
+    )
     return (
         f"💳 <b>Фінанси</b>\n<i>Операції за {period_label}</i>\n\n"
         "💼 <b>Залишки зараз</b>\n" + balances_text + "\n\n"
-        "📊 <b>Рух коштів</b>\n" + flow_text + "\n\n"
-        "🧾 <b>Найбільші категорії витрат</b>\n" + categories + "\n\n"
+        "📊 <b>Рух коштів</b>\n" + flow_text + "\n" + internal_text + "\n"
+        "🧾 <b>Найбільші категорії витрат</b>\n" + categories + "\n<i>Показано до 3 категорій на валюту. Повний перелік — у діаграмі витрат.</i>\n\n"
         "🎯 <b>Бюджетний орієнтир · гривня</b>\n" + budget_text + "\n\n"
         "🐷 <b>Скарбнички</b>\n" + jars_text + uncategorized
     )
@@ -441,7 +447,7 @@ async def comparison(callback: CallbackQuery) -> None:
     except Exception as exc:
         await callback.answer(f"Не вдалося завантажити динаміку: {exc}", show_alert=True)
         return
-    await callback.message.edit_text(comparison_text(data), reply_markup=keyboard([[('← До dashboard', 'finance:menu')]]), parse_mode="HTML")
+    await callback.message.edit_text(comparison_text(data), reply_markup=keyboard([[('← До фінансів', 'finance:menu')]]), parse_mode="HTML")
     await callback.answer()
 
 
@@ -537,7 +543,7 @@ async def show_uncategorized(callback: CallbackQuery) -> None:
         if len(description) > max_description_length:
             description = description[:max_description_length - 1] + "…"
         buttons.append([(f"🏷 {money(row['amount_minor'], int(row['currency_code'] or 980))} · {description}", f"finance:uncategorized:tx:{row['id']}")])
-    buttons.append([("← До dashboard", "finance:menu")])
+    buttons.append([("← До фінансів", "finance:menu")])
     await callback.message.edit_text("\n".join(lines), reply_markup=keyboard(buttons), parse_mode="HTML")
 
 
@@ -587,7 +593,7 @@ async def categorize_uncategorized(callback: CallbackQuery) -> None:
         rule_button = keyboard([
             [("🔗 Завжди застосовувати для таких платежів", f"finance:auto-rule:{transaction_id}:{category_id}")],
             [("← До нерозподілених", "finance:uncategorized")],
-            [("📊 До dashboard", "finance:menu")],
+            [("← До фінансів", "finance:menu")],
         ])
         transaction = next((row for row in await _db.finance_transactions(callback.from_user.id, 100) if row["id"] == transaction_id), None)  # type: ignore[union-attr]
         if transaction and transaction["mcc"] is not None:

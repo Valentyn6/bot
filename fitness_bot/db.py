@@ -1248,6 +1248,10 @@ class Database:
             f"SELECT currency_code, COALESCE(SUM(amount_minor), 0) AS net FROM finance_transactions WHERE telegram_id=? AND is_internal_transfer=1 AND {period_filter} GROUP BY currency_code ORDER BY currency_code",
             (telegram_id, *period_params),
         )).fetchall()
+        internal_transfer_count = await (await db.execute(
+            f"SELECT COUNT(*) AS count FROM finance_transactions WHERE telegram_id=? AND is_internal_transfer=1 AND {period_filter}",
+            (telegram_id, *period_params),
+        )).fetchone()
         categories = await (await db.execute(
             "SELECT c.id AS category_id, c.name AS name, COALESCE(g.budget_group, c.budget_group) AS budget_group, "
             "t.currency_code, SUM(-t.amount_minor) AS amount "
@@ -1271,7 +1275,7 @@ class Database:
             [dict(row) for row in categories],
             uncategorized["count"],
         )
-        return {"income": totals["income"], "expenses": totals["expenses"], "currency_totals": currency_totals, "internal_transfer_totals": internal_transfer_totals, "categories": categories, "top_categories": categories[:3], "uncategorized": uncategorized["count"], "uncategorized_amounts": uncategorized_amounts}
+        return {"income": totals["income"], "expenses": totals["expenses"], "currency_totals": currency_totals, "internal_transfer_totals": internal_transfer_totals, "internal_transfer_count": int(internal_transfer_count["count"]), "categories": categories, "top_categories": categories[:3], "uncategorized": uncategorized["count"], "uncategorized_amounts": uncategorized_amounts}
 
     async def previous_month_income(self, telegram_id: int) -> int:
         today = local_today()
@@ -1575,6 +1579,13 @@ class Database:
             await self._db().execute("UPDATE bot_backup_settings SET last_success_key=?, last_success_at=?, last_error=NULL WHERE id=1", (occurrence_key, datetime.now().astimezone().isoformat(timespec="seconds")))
         else:
             await self._db().execute("UPDATE bot_backup_settings SET last_error=? WHERE id=1", ((error or "Помилка відправлення")[:500],))
+        await self._db().commit()
+
+    async def record_manual_backup_success(self) -> None:
+        await self._db().execute(
+            "UPDATE bot_backup_settings SET last_success_at=?, last_error=NULL WHERE id=1",
+            (datetime.now().astimezone().isoformat(timespec="seconds"),),
+        )
         await self._db().commit()
 
     async def claim_daily_summary(self, telegram_id: int, time_value: str, local_date: str) -> bool:
