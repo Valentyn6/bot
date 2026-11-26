@@ -110,7 +110,7 @@ def is_training_day(row: Any) -> bool:
 
 def is_profile_training_day(profile: Any, activity: Any, day: date) -> bool:
     """Resolve diet day from a configured weekday schedule or legacy activity data."""
-    if profile["diet_mode"] != "split":
+    if profile["diet_mode"] not in {"split", "auto"}:
         return False
     schedule = profile["training_weekdays"]
     if schedule is not None:

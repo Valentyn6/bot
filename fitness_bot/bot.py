@@ -14,6 +14,7 @@ from contextlib import suppress
 from datetime import date, datetime, timedelta
 from html import escape
 from pathlib import Path
+from typing import Any
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramNetworkError, TelegramUnauthorizedError
@@ -30,6 +31,7 @@ from .config import Settings
 from .db import Database
 from .backup import BackupError, make_backup_archive, read_backup_archive
 from .import_health import ImportErrorMessage, parse_food_database, parse_health_export
+from .nutrition_planner import FoodOption, MealFoodRule, MealOption, PlanResult, MEAL_LABELS, generate_day_plan, rotate_grains_by_date
 from .logger_config import setup_logging
 from .finance import router as finance_router
 from .finance.router import configure as configure_finance, money
@@ -52,6 +54,19 @@ reminder_wakeup: asyncio.Event | None = None
 DIET_TRAINING = "training"
 DIET_REST = "rest"
 WEEKDAY_LABELS = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд")
+NUTRITION_MEALS = {
+    "breakfast": ("🌅 Сніданок", 30),
+    "lunch": ("☀️ Обід", 35),
+    "dinner": ("🌙 Вечеря", 35),
+    "snack": ("🍎 Перекус", 0),
+}
+NUTRITION_BASES = {
+    "database": "як у базі продуктів",
+    "dry": "суха вага",
+    "raw": "сира вага",
+    "cooked": "готова вага",
+    "piece": "штуки",
+}
 
 
 def backup_key_ready() -> bool:
@@ -124,6 +139,10 @@ class InputFlow(StatesGroup):
     backup_schedule = State()
     backup_restore_upload = State()
     backup_restore_confirm = State()
+    nutrition_plan_portions = State()
+    nutrition_auto_meal_name = State()
+    nutrition_auto_meal_rename = State()
+    nutrition_auto_food_portions = State()
 
 
 def buttons(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
@@ -222,7 +241,7 @@ async def source_values(profile, diet_type: str | None = None, as_of_date: date 
     training = is_profile_training_day(profile, today_activity, end_date)
     selected_type = diet_type or ("training" if training else "rest")
     configured_schedule = profile["training_weekdays"]
-    if profile["diet_mode"] == "split" and configured_schedule is not None:
+    if profile["diet_mode"] in {"split", "auto"} and configured_schedule is not None:
         try:
             scheduled_weekdays = {int(value) for value in json.loads(configured_schedule)}
             matching_days = [
@@ -346,7 +365,7 @@ async def daily_report(user_id: int, report_day: date | None = None) -> str:
     food_rows = report_food_rows(profile, food_rows, [activity] if activity else [])
     totals = food_totals(food_rows)
     training = is_profile_training_day(profile, activity, today)
-    diet_type = DIET_TRAINING if profile['diet_mode'] == 'split' and training else DIET_REST
+    diet_type = DIET_TRAINING if profile['diet_mode'] in {'split', 'auto'} and training else DIET_REST
     weight, activity_avg, _ = await source_values(profile, diet_type, today)
     targets = calculate_targets(profile, weight, activity_avg)
     habits = await db.habits(user_id)
@@ -602,14 +621,18 @@ def diet_title(diet_type: str) -> str:
 async def food_screen(user_id: int, diet_type: str = DIET_REST) -> tuple[str, InlineKeyboardMarkup]:
     profile = await account_profile(user_id)
     split_mode = profile["diet_mode"] == "split"
-    diet_type = diet_type if split_mode else DIET_REST
+    auto_mode = profile["diet_mode"] == "auto"
+    if auto_mode:
+        diet_type = DIET_TRAINING if await current_day_is_training(profile) else DIET_REST
+    else:
+        diet_type = diet_type if split_mode else DIET_REST
     weight, activity, _ = await source_values(profile, diet_type)
     targets = calculate_targets(profile, weight, activity)
     day_type = "тренувальний" if await current_day_is_training(profile) else "звичайний"
     rows = await db.food_day(profile["id"], local_today().isoformat(), diet_type)
     totals = food_totals(rows)
-    title = diet_title(diet_type) if split_mode else "🍽 Раціон"
-    date_line = f"Раціон за {local_today().isoformat()} · {day_type} день" if split_mode else f"Раціон за {local_today().isoformat()}"
+    title = "🤖 Автоматичний раціон" if auto_mode else diet_title(diet_type) if split_mode else "🍽 Раціон"
+    date_line = f"Раціон за {local_today().isoformat()} · {day_type} день" if split_mode or auto_mode else f"Раціон за {local_today().isoformat()}"
     text = (
         f"{title}\n{date_line}\n\n"
         f"🎯 Цільові показники\n\n"
@@ -635,20 +658,1219 @@ async def food_screen(user_id: int, diet_type: str = DIET_REST) -> tuple[str, In
         recent_meals = await db.recent_food_meals(profile['id'], diet_type)
         if recent_meals:
             diet_buttons.insert(1, [('⚡ Повторити прийом їжі', f'food_repeat_menu:{diet_type}')])
+        diet_buttons.append([('🤖 Налаштувати й скласти меню' if auto_mode else '🤖 Скласти раціон на день', 'nutrition:auto:menu' if auto_mode else f'nutrition:menu:{diet_type}')])
         diet_buttons.append([('💡 Порада на сьогодні', f'food_advice:{diet_type}')])
         diet_buttons.append([('↩️ Видалити останній', f'food_delete:{diet_type}'), ('🔁 Як учора', f'food_yesterday:{diet_type}')])
     else:
         text += "\n\nℹ️ Раціон веде коуч. Самостійне редагування вимкнено."
-    diet_buttons.append([('🔁 Змінити раціон', 'food')])
+    if not auto_mode:
+        diet_buttons.append([('🔁 Змінити раціон', 'food')])
     diet_buttons.append([('← До спорту і раціону', 'sport:menu')])
     return text, buttons(diet_buttons)
+
+
+async def nutrition_planner_access(callback: CallbackQuery) -> bool:
+    if await access_denied(callback):
+        return False
+    if not await may_manage_diet(callback.from_user.id):
+        await callback.answer("Налаштовувати генератор може власник або коуч.", show_alert=True)
+        return False
+    return True
+
+
+async def nutrition_auto_settings_screen(profile, owner_id: int):
+    meals = await db.nutrition_auto_meals(profile["id"])
+    rules = await db.nutrition_auto_rules(profile["id"], owner_id)
+    rows = []
+    for meal in meals:
+        count = sum(1 for rule in rules if int(rule["meal_id"]) == int(meal["id"]) and rule["enabled"])
+        rows.append([(f"🍽 {meal['name']} · {count} продуктів", f"nutrition:auto:meal:{meal['id']}")])
+    rows.extend([
+        [("➕ Створити прийом їжі", "nutrition:auto:meal:add")],
+        [(f"🔁 Повторення продуктів: {'дозволено' if profile['nutrition_allow_duplicates'] else 'заборонено'}", "nutrition:auto:duplicates")],
+        [("📐 Межі порцій і основа ваги", "nutrition:auto:bounds")],
+    ])
+    if meals:
+        rows.extend([
+            [("✨ Створити меню на сьогодні", "nutrition:auto:generate")],
+            [("🗓 Створити план на 7 днів", "nutrition:auto:week:generate")],
+        ])
+        saved_week = await db.nutrition_auto_week_plan_for_date(profile["id"], local_today().isoformat())
+        if saved_week:
+            rows.append([("📋 Відкрити поточний план", f"nutrition:auto:week:view:{saved_week['id']}")])
+    rows.append([("← До раціону", "food")])
+    if not meals:
+        intro = "Поки не створено жодного прийому їжі. Додайте, наприклад, сніданок, обід і вечерю, а потім виберіть дозволені продукти для кожного."
+    else:
+        intro = "Створіть потрібні прийоми їжі, задайте порядок і виберіть дозволені продукти. Ці правила спільні для тренувальних і звичайних днів; ціль КБЖВ визначається за розкладом тренувань."
+    text = f"🤖 <b>Автоматичний раціон</b>\n\n{intro}"
+    return text, buttons(rows)
+
+
+async def nutrition_auto_meal_detail_screen(profile_id: int, owner_id: int, meal_id: int):
+    meals = list(await db.nutrition_auto_meals(profile_id))
+    meal = next((item for item in meals if int(item["id"]) == meal_id), None)
+    if not meal:
+        return None, None
+    rules = await db.nutrition_auto_rules(profile_id, owner_id)
+    selected = {int(row["food_id"]) for row in rules if int(row["meal_id"]) == meal_id and row["enabled"]}
+    foods = await db.foods(owner_id)
+    rows = []
+    for food in foods:
+        check = "✅" if int(food["id"]) in selected else "▫️"
+        rows.append([(f"{check} {food['name'][:48]}", f"nutrition:auto:toggle:{meal_id}:{food['id']}")])
+    position = next(index for index, item in enumerate(meals) if int(item["id"]) == meal_id)
+    actions = []
+    if position:
+        actions.append(("⬆️", f"nutrition:auto:move:{meal_id}:-1"))
+    if position + 1 < len(meals):
+        actions.append(("⬇️", f"nutrition:auto:move:{meal_id}:1"))
+    if actions:
+        rows.append(actions)
+    rows.extend([
+        [("✏️ Перейменувати", f"nutrition:auto:rename:{meal_id}")],
+        [("📐 Межі порцій і вага", f"nutrition:auto:bounds:{meal_id}")],
+        [("🗑 Видалити прийом їжі", f"nutrition:auto:delete:{meal_id}")],
+        [("← До автоматичного раціону", "nutrition:auto:menu")],
+    ])
+    return f"🍽 <b>{escape(meal['name'])}</b>\n\nНатискайте продукти, щоб дозволити або заборонити їх у цьому прийомі їжі.", buttons(rows)
+
+
+@router.callback_query(F.data == "nutrition:auto:menu")
+async def nutrition_auto_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await nutrition_planner_access(callback):
+        return
+    await state.clear()
+    profile = await account_profile(callback.from_user.id)
+    if profile["diet_mode"] != "auto":
+        await callback.answer("Спершу виберіть режим «Автоматичний раціон» в адмін-панелі.", show_alert=True)
+        return
+    text, markup = await nutrition_auto_settings_screen(profile, await db.food_owner(callback.from_user.id))
+    await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "nutrition:auto:meal:add")
+async def nutrition_auto_meal_add_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await nutrition_planner_access(callback):
+        return
+    await state.clear()
+    await state.set_state(InputFlow.nutrition_auto_meal_name)
+    await callback.message.edit_text(
+        "Введіть назву нового прийому їжі (до 32 символів), наприклад «Сніданок» або «Перекус 2».",
+        reply_markup=buttons([[('✖️ Скасувати', 'nutrition:auto:menu')]]),
+    )
+    await callback.answer()
+
+
+@router.message(InputFlow.nutrition_auto_meal_name)
+async def nutrition_auto_meal_add_received(message: Message, state: FSMContext) -> None:
+    if await access_denied(message) or not await may_manage_diet(message.from_user.id):
+        await state.clear()
+        return
+    try:
+        profile = await account_profile(message.from_user.id)
+        await db.add_nutrition_auto_meal(profile["id"], message.text or "")
+    except ValueError as exc:
+        await message.answer(str(exc))
+        return
+    await state.clear()
+    text, markup = await nutrition_auto_settings_screen(profile, await db.food_owner(message.from_user.id))
+    await message.answer("✅ Прийом їжі створено. Тепер відкрийте його й виберіть продукти.\n\n" + text, reply_markup=markup, parse_mode="HTML")
+
+
+@router.callback_query(F.data.regexp(r"^nutrition:auto:meal:\d+$"))
+async def nutrition_auto_meal_detail(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await nutrition_planner_access(callback):
+        return
+    await state.clear()
+    try:
+        meal_id = int(callback.data.rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Прийом їжі не знайдено.", show_alert=True)
+        return
+    profile = await account_profile(callback.from_user.id)
+    text, markup = await nutrition_auto_meal_detail_screen(profile["id"], await db.food_owner(callback.from_user.id), meal_id)
+    if not text:
+        await callback.answer("Прийом їжі вже видалено.", show_alert=True)
+        return
+    await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("nutrition:auto:rename:"))
+async def nutrition_auto_meal_rename_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await nutrition_planner_access(callback):
+        return
+    meal_id = int(callback.data.rsplit(":", 1)[1])
+    profile = await account_profile(callback.from_user.id)
+    meal = next((item for item in await db.nutrition_auto_meals(profile["id"]) if int(item["id"]) == meal_id), None)
+    if not meal:
+        await callback.answer("Прийом їжі не знайдено.", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(InputFlow.nutrition_auto_meal_rename)
+    await state.update_data(nutrition_auto_meal_id=meal_id)
+    await callback.message.edit_text(
+        f"Введіть нову назву для «{escape(meal['name'])}» (до 32 символів).",
+        reply_markup=buttons([[('✖️ Скасувати', f"nutrition:auto:meal:{meal_id}")]]),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.message(InputFlow.nutrition_auto_meal_rename)
+async def nutrition_auto_meal_rename_received(message: Message, state: FSMContext) -> None:
+    if await access_denied(message) or not await may_manage_diet(message.from_user.id):
+        await state.clear()
+        return
+    data = await state.get_data()
+    try:
+        profile = await account_profile(message.from_user.id)
+        await db.rename_nutrition_auto_meal(profile["id"], int(data["nutrition_auto_meal_id"]), message.text or "")
+    except (ValueError, KeyError) as exc:
+        await message.answer(str(exc) or "Не вдалося змінити назву.")
+        return
+    await state.clear()
+    text, markup = await nutrition_auto_meal_detail_screen(profile["id"], await db.food_owner(message.from_user.id), int(data["nutrition_auto_meal_id"]))
+    await message.answer("✅ Назву змінено.\n\n" + text, reply_markup=markup, parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("nutrition:auto:move:"))
+async def nutrition_auto_meal_move(callback: CallbackQuery) -> None:
+    if not await nutrition_planner_access(callback):
+        return
+    try:
+        _, _, _, raw_id, raw_direction = callback.data.split(":")
+        meal_id, direction = int(raw_id), int(raw_direction)
+    except ValueError:
+        await callback.answer("Не вдалося змінити порядок.", show_alert=True)
+        return
+    profile = await account_profile(callback.from_user.id)
+    await db.move_nutrition_auto_meal(profile["id"], meal_id, direction)
+    text, markup = await nutrition_auto_meal_detail_screen(profile["id"], await db.food_owner(callback.from_user.id), meal_id)
+    if text:
+        await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+    await callback.answer("Порядок оновлено.")
+
+
+@router.callback_query(F.data.regexp(r"^nutrition:auto:delete:\d+$"))
+async def nutrition_auto_meal_delete_prompt(callback: CallbackQuery) -> None:
+    if not await nutrition_planner_access(callback):
+        return
+    meal_id = int(callback.data.rsplit(":", 1)[1])
+    profile = await account_profile(callback.from_user.id)
+    meal = next((item for item in await db.nutrition_auto_meals(profile["id"]) if int(item["id"]) == meal_id), None)
+    if not meal:
+        await callback.answer("Прийом їжі вже видалено.", show_alert=True)
+        return
+    await callback.message.edit_text(
+        f"Видалити «{escape(meal['name'])}» і налаштування його продуктів?",
+        reply_markup=buttons([
+            [("Так, видалити", f"nutrition:auto:delete-confirm:{meal_id}")],
+            [("← Назад", f"nutrition:auto:meal:{meal_id}")],
+        ]),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("nutrition:auto:delete-confirm:"))
+async def nutrition_auto_meal_delete_confirm(callback: CallbackQuery) -> None:
+    if not await nutrition_planner_access(callback):
+        return
+    meal_id = int(callback.data.rsplit(":", 1)[1])
+    profile = await account_profile(callback.from_user.id)
+    await db.delete_nutrition_auto_meal(profile["id"], meal_id)
+    text, markup = await nutrition_auto_settings_screen(profile, await db.food_owner(callback.from_user.id))
+    await callback.message.edit_text("🗑 Прийом їжі та його правила видалено.\n\n" + text, reply_markup=markup, parse_mode="HTML")
+    await callback.answer("Видалено")
+
+
+@router.callback_query(F.data.startswith("nutrition:auto:toggle:"))
+async def nutrition_auto_food_toggle(callback: CallbackQuery) -> None:
+    if not await nutrition_planner_access(callback):
+        return
+    try:
+        _, _, _, meal_text, food_text = callback.data.split(":")
+        meal_id, food_id = int(meal_text), int(food_text)
+    except ValueError:
+        await callback.answer("Некоректний продукт.", show_alert=True)
+        return
+    profile = await account_profile(callback.from_user.id)
+    rules = await db.nutrition_auto_rules(profile["id"], await db.food_owner(callback.from_user.id))
+    currently_enabled = any(int(rule["meal_id"]) == meal_id and int(rule["food_id"]) == food_id and rule["enabled"] for rule in rules)
+    try:
+        await db.set_nutrition_auto_food_enabled(profile["id"], meal_id, food_id, not currently_enabled, await db.food_owner(callback.from_user.id))
+    except ValueError as exc:
+        await callback.answer(str(exc), show_alert=True)
+        return
+    text, markup = await nutrition_auto_meal_detail_screen(profile["id"], await db.food_owner(callback.from_user.id), meal_id)
+    await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+    await callback.answer("Продукт дозволено." if not currently_enabled else "Продукт заборонено.")
+
+
+@router.callback_query(F.data == "nutrition:auto:duplicates")
+async def nutrition_auto_duplicates_toggle(callback: CallbackQuery) -> None:
+    if not await nutrition_planner_access(callback):
+        return
+    profile = await account_profile(callback.from_user.id)
+    enabled = not bool(profile["nutrition_allow_duplicates"])
+    await db.update_profile(profile["id"], nutrition_allow_duplicates=int(enabled))
+    profile = await account_profile(callback.from_user.id)
+    text, markup = await nutrition_auto_settings_screen(profile, await db.food_owner(callback.from_user.id))
+    await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+    await callback.answer("Повторення дозволено." if enabled else "Повторення заборонено.")
+
+
+@router.callback_query(F.data == "nutrition:auto:bounds")
+async def nutrition_auto_bounds_list(callback: CallbackQuery) -> None:
+    if not await nutrition_planner_access(callback):
+        return
+    profile = await account_profile(callback.from_user.id)
+    rules = [row for row in await db.nutrition_auto_rules(profile["id"], await db.food_owner(callback.from_user.id)) if row["enabled"]]
+    rows = [[(
+        f"{rule['meal_name']} · {rule['name'][:24]} · до {rule['maximum']:g} {rule['unit']}",
+        f"nutrition:auto:rule:{rule['meal_id']}:{rule['food_id']}",
+    )] for rule in rules]
+    rows.append([("← До автоматичного раціону", "nutrition:auto:menu")])
+    text = "📐 <b>Межі порцій і основа ваги</b>\n\nВиберіть продукт, щоб змінити його порцію, крок або вагу."
+    if not rules:
+        text += "\n\nПоки немає дозволених продуктів. Спочатку створіть прийом їжі й виберіть у ньому продукти."
+    await callback.message.edit_text(text, reply_markup=buttons(rows), parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("nutrition:auto:bounds:"))
+async def nutrition_auto_meal_bounds(callback: CallbackQuery) -> None:
+    if not await nutrition_planner_access(callback):
+        return
+    try:
+        meal_id = int(callback.data.rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Прийом їжі не знайдено.", show_alert=True)
+        return
+    profile = await account_profile(callback.from_user.id)
+    rules = [row for row in await db.nutrition_auto_rules(profile["id"], await db.food_owner(callback.from_user.id)) if int(row["meal_id"]) == meal_id and row["enabled"]]
+    rows = [[(
+        f"{rule['name'][:30]} · до {rule['maximum']:g} {rule['unit']}",
+        f"nutrition:auto:rule:{meal_id}:{rule['food_id']}",
+    )] for rule in rules]
+    rows.append([("← До прийому їжі", f"nutrition:auto:meal:{meal_id}")])
+    name = next((item["name"] for item in await db.nutrition_auto_meals(profile["id"]) if int(item["id"]) == meal_id), "Прийом їжі")
+    text = f"📐 <b>Порції · {escape(name)}</b>\n\nОберіть продукт для редагування."
+    if not rules:
+        text += "\n\nДля цього прийому ще не вибрано продуктів."
+    await callback.message.edit_text(text, reply_markup=buttons(rows), parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("nutrition:auto:rule:"))
+async def nutrition_auto_rule(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await nutrition_planner_access(callback):
+        return
+    await state.clear()
+    try:
+        _, _, _, meal_text, food_text = callback.data.split(":")
+        meal_id, food_id = int(meal_text), int(food_text)
+    except ValueError:
+        await callback.answer("Некоректний продукт.", show_alert=True)
+        return
+    profile = await account_profile(callback.from_user.id)
+    owner_id = await db.food_owner(callback.from_user.id)
+    row = next((item for item in await db.nutrition_auto_rules(profile["id"], owner_id) if int(item["meal_id"]) == meal_id and int(item["food_id"]) == food_id and item["enabled"]), None)
+    if not row:
+        await callback.answer("Продукт не дозволений для цього прийому.", show_alert=True)
+        return
+    basis = NUTRITION_BASES.get(row["weight_basis"], NUTRITION_BASES["database"])
+    text = (
+        f"📐 <b>{escape(row['name'])}</b> · {escape(row['meal_name'])}\n\n"
+        f"Порція: {row['minimum']:g}–{row['maximum']:g} {row['unit']} · крок {row['step']:g}\n"
+        f"Основа ваги: {basis}."
+    )
+    rows = [[("✏️ Змінити межі й крок", f"nutrition:auto:bounds-edit:{meal_id}:{food_id}")]]
+    if row["unit"] == "шт":
+        rows.append([("⚖️ Вага: штуки", f"nutrition:auto:basis:{meal_id}:{food_id}:piece")])
+    else:
+        rows.extend([
+            [("🥣 Суха вага", f"nutrition:auto:basis:{meal_id}:{food_id}:dry"), ("🥩 Сира вага", f"nutrition:auto:basis:{meal_id}:{food_id}:raw")],
+            [("🍲 Готова вага", f"nutrition:auto:basis:{meal_id}:{food_id}:cooked"), ("📦 Як у базі", f"nutrition:auto:basis:{meal_id}:{food_id}:database")],
+        ])
+    rows.append([("← До порцій", f"nutrition:auto:bounds:{meal_id}")])
+    await callback.message.edit_text(text, reply_markup=buttons(rows), parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("nutrition:auto:basis:"))
+async def nutrition_auto_basis(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await nutrition_planner_access(callback):
+        return
+    try:
+        _, _, _, meal_text, food_text, basis = callback.data.split(":")
+        meal_id, food_id = int(meal_text), int(food_text)
+    except ValueError:
+        await callback.answer("Некоректна основа ваги.", show_alert=True)
+        return
+    profile = await account_profile(callback.from_user.id)
+    updated = await db.set_nutrition_auto_weight_basis(profile["id"], meal_id, food_id, basis, await db.food_owner(callback.from_user.id))
+    if not updated:
+        await callback.answer("Спочатку дозвольте цей продукт для прийому.", show_alert=True)
+        return
+    row = next((item for item in await db.nutrition_auto_rules(profile["id"], await db.food_owner(callback.from_user.id)) if int(item["meal_id"]) == meal_id and int(item["food_id"]) == food_id and item["enabled"]), None)
+    basis_label = NUTRITION_BASES.get(row["weight_basis"], NUTRITION_BASES["database"])
+    text = f"📐 <b>{escape(row['name'])}</b> · {escape(row['meal_name'])}\n\nПорція: {row['minimum']:g}–{row['maximum']:g} {row['unit']} · крок {row['step']:g}\nОснова ваги: {basis_label}."
+    rows = [[("✏️ Змінити межі й крок", f"nutrition:auto:bounds-edit:{meal_id}:{food_id}")]]
+    if row["unit"] == "шт":
+        rows.append([("⚖️ Вага: штуки", f"nutrition:auto:basis:{meal_id}:{food_id}:piece")])
+    else:
+        rows.extend([
+            [("🥣 Суха вага", f"nutrition:auto:basis:{meal_id}:{food_id}:dry"), ("🥩 Сира вага", f"nutrition:auto:basis:{meal_id}:{food_id}:raw")],
+            [("🍲 Готова вага", f"nutrition:auto:basis:{meal_id}:{food_id}:cooked"), ("📦 Як у базі", f"nutrition:auto:basis:{meal_id}:{food_id}:database")],
+        ])
+    rows.append([("← До порцій", f"nutrition:auto:bounds:{meal_id}")])
+    await callback.message.edit_text(text, reply_markup=buttons(rows), parse_mode="HTML")
+    await callback.answer("Основу ваги збережено.")
+
+
+@router.callback_query(F.data.startswith("nutrition:auto:bounds-edit:"))
+async def nutrition_auto_bounds_edit(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await nutrition_planner_access(callback):
+        return
+    try:
+        _, _, _, meal_text, food_text = callback.data.split(":")
+        meal_id, food_id = int(meal_text), int(food_text)
+    except ValueError:
+        await callback.answer("Некоректні параметри порції.", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(InputFlow.nutrition_auto_food_portions)
+    await state.update_data(nutrition_auto_rule={"meal_id": meal_id, "food_id": food_id})
+    await callback.message.edit_text(
+        "Введіть мінімум, максимум і крок порції через пробіл. Наприклад: <code>0 120 5</code>. Для штук використовуйте цілі значення й крок 1.",
+        reply_markup=buttons([[('✖️ Скасувати', f"nutrition:auto:rule:{meal_id}:{food_id}")]]),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.message(InputFlow.nutrition_auto_food_portions)
+async def nutrition_auto_bounds_received(message: Message, state: FSMContext) -> None:
+    if await access_denied(message) or not await may_manage_diet(message.from_user.id):
+        await state.clear()
+        return
+    data = await state.get_data()
+    try:
+        if len((message.text or "").split()) != 3:
+            raise ValueError("Введіть три числа: мінімум, максимум і крок.")
+        minimum, maximum, step = (parse_number(value) for value in message.text.split())
+        profile = await account_profile(message.from_user.id)
+        rule = data["nutrition_auto_rule"]
+        await db.update_nutrition_auto_food_rule(profile["id"], int(rule["meal_id"]), int(rule["food_id"]), minimum, maximum, step, await db.food_owner(message.from_user.id))
+    except (ValueError, KeyError) as exc:
+        await message.answer(str(exc))
+        return
+    await state.clear()
+    await message.answer("✅ Межі порції збережено.", reply_markup=buttons([[('← До порцій', f"nutrition:auto:bounds:{rule['meal_id']}")]]))
+
+
+async def generate_custom_nutrition_day(profile, owner_id: int, plan_date: date):
+    meals = await db.nutrition_auto_meals(profile["id"])
+    rows = [row for row in await db.nutrition_auto_rules(profile["id"], owner_id) if row["enabled"]]
+    grouped: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        food_id = int(row["food_id"])
+        item = grouped.setdefault(food_id, {"row": row, "rules": []})
+        item["rules"].append(MealFoodRule(
+            meal_key=row["meal_key"], minimum=float(row["minimum"]), maximum=float(row["maximum"]),
+            step=float(row["step"]), preferred=float(row["preferred"]) if row["preferred"] is not None else None,
+        ))
+    foods = []
+    for food_id, item in grouped.items():
+        row = item["row"]
+        foods.append(FoodOption(
+            product_id=food_id, name=row["name"], unit=row["unit"],
+            calories=float(row["calories"]), protein=float(row["protein"]), fat=float(row["fat"]), carbs=float(row["carbs"]),
+            rules=tuple(item["rules"]), weight_basis=row["weight_basis"],
+        ))
+    foods = rotate_grains_by_date(foods, plan_date)
+    meal_options = [
+        MealOption(key=row["meal_key"], calorie_share=1, required=True, label=row["name"])
+        for row in meals
+    ]
+    activity = await db.activity_on_date(profile["id"], plan_date.isoformat())
+    diet_type = DIET_TRAINING if is_profile_training_day(profile, activity, plan_date) else DIET_REST
+    weight, activity_average, warning = await source_values(profile, diet_type, plan_date)
+    calculated = calculate_targets(profile, weight, activity_average)
+    targets = {
+        "calories": float(calculated["total"]), "protein": float(calculated["protein"]),
+        "fat": float(calculated["fat"]), "carbs": float(calculated["carbs"]),
+    }
+    if not meals:
+        result = PlanResult("infeasible", message="Спочатку створіть хоча б один прийом їжі.")
+    else:
+        result = generate_day_plan(
+            foods, targets, meal_options,
+            allow_food_repeats=bool(profile["nutrition_allow_duplicates"]),
+        )
+    return result, targets, warning, meal_options, diet_type
+
+
+async def refresh_custom_nutrition_week(profile, owner_id: int, plan_row):
+    today = local_today()
+    days = json.loads(plan_row["days_json"])
+    changed = 0
+    for index, old in enumerate(days):
+        plan_date = date.fromisoformat(old["date"])
+        if plan_date <= today or old.get("applied"):
+            continue
+        activity = await db.activity_on_date(profile["id"], plan_date.isoformat())
+        diet_type = DIET_TRAINING if is_profile_training_day(profile, activity, plan_date) else DIET_REST
+        weight, activity_average, _ = await source_values(profile, diet_type, plan_date)
+        calculated = calculate_targets(profile, weight, activity_average)
+        targets = {
+            "calories": float(calculated["total"]), "protein": float(calculated["protein"]),
+            "fat": float(calculated["fat"]), "carbs": float(calculated["carbs"]),
+        }
+        old_targets = old.get("targets") or {}
+        if diet_type == old["diet_type"] and all(abs(targets[key] - float(old_targets.get(key, 0))) < 0.5 for key in targets):
+            continue
+        result, targets, warning, meals, diet_type = await generate_custom_nutrition_day(profile, owner_id, plan_date)
+        if result.status not in {"optimal", "feasible"} or not result.items or not result.totals:
+            logging.warning("Could not refresh custom nutrition plan for profile %s on %s: %s", profile["id"], plan_date, result.message)
+            continue
+        days[index] = {
+            "date": old["date"], "diet_type": diet_type, "applied": False,
+            "items": [{"product_id": item.product_id, "name": item.name, "meal_key": item.meal, "meal_name": item.meal_label, "quantity": item.quantity, "unit": item.unit, "weight_basis": item.weight_basis} for item in result.items],
+            "totals": result.totals, "targets": result.targets or targets, "warning": warning,
+        }
+        changed += 1
+    if changed:
+        await db.update_nutrition_auto_week_plan_days(profile["id"], int(plan_row["id"]), days)
+        plan_row = await db.nutrition_auto_week_plan(profile["id"], int(plan_row["id"]))
+    return plan_row, days, changed
+
+
+def custom_nutrition_week_screen(plan_row, days: list[dict], refreshed: int = 0):
+    start = date.fromisoformat(plan_row["start_date"])
+    end = date.fromisoformat(plan_row["end_date"])
+    lines = [f"🗓 <b>План раціону · {start.strftime('%d.%m')}–{end.strftime('%d.%m.%Y')}</b>"]
+    if refreshed:
+        lines.append(f"\nМайбутні дні оновлено за новими цілями: {refreshed}.")
+    rows = []
+    for day in days:
+        current = date.fromisoformat(day["date"])
+        label = "🏋️ тренувальний" if day["diet_type"] == DIET_TRAINING else "🛋 звичайний"
+        targets, totals = day.get("targets") or {}, day.get("totals") or {}
+        lines.append(
+            f"\n<b>{WEEKDAY_LABELS[current.weekday()]} {current.strftime('%d.%m')}</b> · {label}\n"
+            f"Ціль {float(targets.get('calories', 0)):.0f} ккал · меню {float(totals.get('calories', 0)):.0f} ккал"
+            + (" · ✅ додано" if day.get("applied") else "")
+        )
+        rows.append([(f"{WEEKDAY_LABELS[current.weekday()]} {current.strftime('%d.%m')} · {label}", f"nutrition:auto:week:day:{plan_row['id']}:{current.isoformat()}")])
+    rows.extend([
+        [("🔄 Перегенерувати тиждень", "nutrition:auto:week:generate")],
+        [("← До автоматичного раціону", "nutrition:auto:menu")],
+    ])
+    return "\n".join(lines), buttons(rows)
+
+
+def custom_nutrition_week_day_screen(plan_id: int, day: dict):
+    current = date.fromisoformat(day["date"])
+    targets, totals = day.get("targets") or {}, day.get("totals") or {}
+    kind = "тренувальний" if day["diet_type"] == DIET_TRAINING else "звичайний"
+    lines = [
+        f"🗓 <b>{WEEKDAY_LABELS[current.weekday()]} · {current.strftime('%d.%m.%Y')}</b>",
+        f"{kind.capitalize()} день · цілі {float(targets.get('calories', 0)):.0f} ккал · меню {float(totals.get('calories', 0)):.0f} ккал",
+    ]
+    grouped: dict[str, list[dict]] = {}
+    for item in day.get("items", []):
+        grouped.setdefault(item.get("meal_name") or item.get("meal_key") or "Прийом їжі", []).append(item)
+    for meal_name, items in grouped.items():
+        lines.extend(("", f"<b>{escape(meal_name)}</b>"))
+        lines.extend(f"• {escape(item['name'])} — {float(item['quantity']):g} {escape(item['unit'])}" for item in items)
+    lines.extend((
+        "",
+        f"<b>Разом:</b> {float(totals.get('calories', 0)):.0f} ккал · Б {float(totals.get('protein', 0)):.1f} г · Ж {float(totals.get('fat', 0)):.1f} г · В {float(totals.get('carbs', 0)):.1f} г",
+    ))
+    rows = []
+    if current == local_today() and not day.get("applied"):
+        rows.append([("✅ Додати до раціону за сьогодні", f"nutrition:auto:week:apply:{plan_id}:{current.isoformat()}")])
+    if current >= local_today() and not day.get("applied"):
+        rows.append([("🔄 Перегенерувати цей день", f"nutrition:auto:week:regenerate:{plan_id}:{current.isoformat()}")])
+    rows.append([("← До плану на 7 днів", f"nutrition:auto:week:view:{plan_id}")])
+    return "\n".join(lines), buttons(rows)
+
+
+@router.callback_query(F.data == "nutrition:auto:week:generate")
+async def nutrition_auto_week_generate(callback: CallbackQuery) -> None:
+    if not await nutrition_planner_access(callback):
+        return
+    profile = await account_profile(callback.from_user.id)
+    if profile["diet_mode"] != "auto":
+        await callback.answer("Планування доступне в режимі «Автоматичний раціон».", show_alert=True)
+        return
+    owner_id = await db.food_owner(callback.from_user.id)
+    start = local_today()
+    existing_plan = await db.nutrition_auto_week_plan_for_date(profile["id"], start.isoformat())
+    existing_days = {item["date"]: item for item in json.loads(existing_plan["days_json"])} if existing_plan else {}
+    days = []
+    await callback.answer("Створюю меню на сім днів…")
+    for offset in range(7):
+        plan_date = start + timedelta(days=offset)
+        previous = existing_days.get(plan_date.isoformat())
+        if previous and (plan_date < start or previous.get("applied")):
+            days.append(previous)
+            continue
+        try:
+            result, targets, warning, _, diet_type = await generate_custom_nutrition_day(profile, owner_id, plan_date)
+        except (ValueError, KeyError) as exc:
+            await callback.message.edit_text(f"⚠️ Не вдалося скласти меню на {plan_date.strftime('%d.%m')}: {escape(str(exc))}", reply_markup=buttons([[('📐 Налаштування', 'nutrition:auto:menu')]]))
+            return
+        if result.status not in {"optimal", "feasible"} or not result.items or not result.totals:
+            await callback.message.edit_text(
+                f"⚠️ Не вдалося скласти меню на {WEEKDAY_LABELS[plan_date.weekday()]} {plan_date.strftime('%d.%m')}.\n\n{escape(result.message or 'Перевірте прийоми їжі, продукти та порції.')}",
+                reply_markup=buttons([[('📐 Налаштування', 'nutrition:auto:menu')]]),
+            )
+            return
+        days.append({
+            "date": plan_date.isoformat(), "diet_type": diet_type, "applied": False,
+            "items": [{"product_id": item.product_id, "name": item.name, "meal_key": item.meal, "meal_name": item.meal_label, "quantity": item.quantity, "unit": item.unit, "weight_basis": item.weight_basis} for item in result.items],
+            "totals": result.totals, "targets": result.targets or targets, "warning": warning,
+        })
+    plan_id = await db.save_nutrition_auto_week_plan(profile["id"], start.isoformat(), (start + timedelta(days=6)).isoformat(), days)
+    plan_row = await db.nutrition_auto_week_plan(profile["id"], plan_id)
+    text, markup = custom_nutrition_week_screen(plan_row, days)
+    await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("nutrition:auto:week:view:"))
+async def nutrition_auto_week_view(callback: CallbackQuery) -> None:
+    if not await nutrition_planner_access(callback):
+        return
+    try:
+        plan_id = int(callback.data.rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("План не знайдено.", show_alert=True)
+        return
+    profile = await account_profile(callback.from_user.id)
+    plan_row = await db.nutrition_auto_week_plan(profile["id"], plan_id)
+    if not plan_row:
+        await callback.answer("План не знайдено.", show_alert=True)
+        return
+    plan_row, days, refreshed = await refresh_custom_nutrition_week(profile, await db.food_owner(callback.from_user.id), plan_row)
+    text, markup = custom_nutrition_week_screen(plan_row, days, refreshed)
+    await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+    await callback.answer()
+
+
+async def nutrition_auto_week_get_day(callback: CallbackQuery, plan_id: int, day_text: str):
+    profile = await account_profile(callback.from_user.id)
+    plan_row = await db.nutrition_auto_week_plan(profile["id"], plan_id)
+    if not plan_row:
+        await callback.answer("План не знайдено.", show_alert=True)
+        return None
+    days = json.loads(plan_row["days_json"])
+    day = next((entry for entry in days if entry["date"] == day_text), None)
+    if not day:
+        await callback.answer("День не знайдено.", show_alert=True)
+        return None
+    return profile, plan_row, days, day
+
+
+@router.callback_query(F.data.startswith("nutrition:auto:week:day:"))
+async def nutrition_auto_week_day(callback: CallbackQuery) -> None:
+    if not await nutrition_planner_access(callback):
+        return
+    try:
+        _, _, _, _, plan_text, day_text = callback.data.split(":")
+        plan_id = int(plan_text)
+    except ValueError:
+        await callback.answer("Некоректний день.", show_alert=True)
+        return
+    payload = await nutrition_auto_week_get_day(callback, plan_id, day_text)
+    if not payload:
+        return
+    _, _, _, day = payload
+    text, markup = custom_nutrition_week_day_screen(plan_id, day)
+    await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("nutrition:auto:week:regenerate:"))
+async def nutrition_auto_week_regenerate_day(callback: CallbackQuery) -> None:
+    if not await nutrition_planner_access(callback):
+        return
+    try:
+        _, _, _, _, plan_text, day_text = callback.data.split(":")
+        plan_id = int(plan_text)
+    except ValueError:
+        await callback.answer("Некоректний день.", show_alert=True)
+        return
+    payload = await nutrition_auto_week_get_day(callback, plan_id, day_text)
+    if not payload:
+        return
+    profile, plan_row, days, day = payload
+    plan_date = date.fromisoformat(day_text)
+    if plan_date < local_today() or day.get("applied"):
+        await callback.answer("Минулі або вже додані дні не змінюються.", show_alert=True)
+        return
+    await callback.answer("Перегенеровую день…")
+    result, targets, warning, _, diet_type = await generate_custom_nutrition_day(profile, await db.food_owner(callback.from_user.id), plan_date)
+    if result.status not in {"optimal", "feasible"} or not result.items or not result.totals:
+        await callback.answer(result.message or "Не вдалося скласти меню.", show_alert=True)
+        return
+    new_day = {
+        "date": day_text, "diet_type": diet_type, "applied": False,
+        "items": [{"product_id": item.product_id, "name": item.name, "meal_key": item.meal, "meal_name": item.meal_label, "quantity": item.quantity, "unit": item.unit, "weight_basis": item.weight_basis} for item in result.items],
+        "totals": result.totals, "targets": result.targets or targets, "warning": warning,
+    }
+    days = [new_day if entry["date"] == day_text else entry for entry in days]
+    await db.update_nutrition_auto_week_plan_days(profile["id"], plan_id, days)
+    text, markup = custom_nutrition_week_day_screen(plan_id, new_day)
+    await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("nutrition:auto:week:apply:"))
+async def nutrition_auto_week_apply_day(callback: CallbackQuery) -> None:
+    if not await nutrition_planner_access(callback):
+        return
+    try:
+        _, _, _, _, plan_text, day_text = callback.data.split(":")
+        plan_id = int(plan_text)
+    except ValueError:
+        await callback.answer("Некоректний день.", show_alert=True)
+        return
+    payload = await nutrition_auto_week_get_day(callback, plan_id, day_text)
+    if not payload:
+        return
+    profile, plan_row, days, day = payload
+    if day_text != local_today().isoformat() or day.get("applied"):
+        await callback.answer("Додати можна лише сьогоднішній план і тільки один раз.", show_alert=True)
+        return
+    items = [{"product_id": item["product_id"], "meal": item.get("meal_name") or item.get("meal_key"), "quantity": item["quantity"], "unit": item["unit"]} for item in day["items"]]
+    draft_id = await db.save_nutrition_plan_draft(profile["id"], day["diet_type"], day_text, items, day["totals"], day["targets"])
+    try:
+        applied = await db.apply_nutrition_plan_draft(profile["id"], draft_id, local_today().isoformat())
+    except Exception:
+        logging.exception("Failed to apply weekly auto nutrition plan %s for profile %s", plan_id, profile["id"])
+        await callback.answer("Не вдалося додати план. Фактичний раціон не змінено.", show_alert=True)
+        return
+    if not applied:
+        await callback.answer("План уже доданий або дата минула.", show_alert=True)
+        return
+    day["applied"] = True
+    await db.update_nutrition_auto_week_plan_days(profile["id"], plan_id, days)
+    text, markup = await food_screen(callback.from_user.id, day["diet_type"])
+    await callback.message.edit_text("✅ План додано до фактичного раціону.\n\n" + text, reply_markup=markup)
+    await callback.answer("Раціон оновлено")
+
+
+@router.callback_query(F.data == "nutrition:auto:generate")
+async def nutrition_auto_generate(callback: CallbackQuery) -> None:
+    if not await nutrition_planner_access(callback):
+        return
+    profile = await account_profile(callback.from_user.id)
+    if profile["diet_mode"] != "auto":
+        await callback.answer("Цей генератор доступний у режимі «Автоматичний раціон».", show_alert=True)
+        return
+    today = local_today()
+    owner_id = await db.food_owner(callback.from_user.id)
+    try:
+        result, targets, warning, meal_options, diet_type = await generate_custom_nutrition_day(profile, owner_id, today)
+    except (ValueError, KeyError) as exc:
+        await callback.answer(f"Не вдалося скласти меню: {exc}", show_alert=True)
+        return
+    if result.status not in {"optimal", "feasible"} or not result.items or not result.totals:
+        await callback.message.edit_text(
+            "⚠️ <b>Не вдалося скласти меню</b>\n\n" + escape(result.message or "Перевірте прийоми їжі, вибрані продукти й межі порцій."),
+            reply_markup=buttons([
+                [("📐 Налаштування автоматичного раціону", "nutrition:auto:menu")],
+                [("← До раціону", "food")],
+            ]),
+            parse_mode="HTML",
+        )
+        await callback.answer()
+        return
+    totals = result.totals
+    target_values = result.targets or targets
+    day_label = "тренувальний день" if diet_type == DIET_TRAINING else "звичайний день"
+    lines = [
+        f"🧠 <b>Чернетка меню · {today.strftime('%d.%m.%Y')}</b>",
+        f"Сьогодні {day_label} — цілі визначені за розкладом тренувань.",
+        "",
+        f"Цілі: {target_values['calories']:.0f} ккал · Б {target_values['protein']:.0f} г · Ж {target_values['fat']:.0f} г · В {target_values['carbs']:.0f} г",
+    ]
+    for meal in meal_options:
+        meal_items = [item for item in result.items if item.meal == meal.key]
+        if not meal_items:
+            continue
+        lines.extend(("", f"<b>{escape(meal.label or meal.key)}</b>"))
+        for item in meal_items:
+            basis = NUTRITION_BASES.get(item.weight_basis, NUTRITION_BASES["database"])
+            suffix = f" · {basis}" if item.weight_basis != "database" else ""
+            lines.append(f"• {escape(item.name)} — {item.quantity:g} {item.unit}{suffix}")
+    lines.extend((
+        "",
+        f"<b>Разом:</b> {totals['calories']:.0f} ккал · Б {totals['protein']:.1f} г · Ж {totals['fat']:.1f} г · В {totals['carbs']:.1f} г",
+        f"Відхилення: {totals['calories'] - target_values['calories']:+.0f} ккал · Б {totals['protein'] - target_values['protein']:+.1f} г · Ж {totals['fat'] - target_values['fat']:+.1f} г · В {totals['carbs'] - target_values['carbs']:+.1f} г",
+        "",
+        "Це чернетка — до щоденника вона потрапить лише після підтвердження.",
+    ))
+    if warning:
+        lines.extend(("", escape(warning)))
+    draft_id = await db.save_nutrition_plan_draft(
+        profile["id"], diet_type, today.isoformat(),
+        [{"product_id": item.product_id, "meal": item.meal_label, "quantity": item.quantity, "unit": item.unit} for item in result.items],
+        totals, target_values,
+    )
+    await callback.message.edit_text(
+        "\n".join(lines),
+        reply_markup=buttons([
+            [("✅ Додати до фактичного раціону", f"nutrition:apply:{draft_id}")],
+            [("🔄 Згенерувати ще раз", "nutrition:auto:generate")],
+            [("📐 Налаштування автоматичного раціону", "nutrition:auto:menu")],
+            [("← До раціону", "food")],
+        ]),
+        parse_mode="HTML",
+    )
+    await callback.answer("Чернетку готово.")
+
+
+def nutrition_meal_label(meal_key: str) -> str:
+    return NUTRITION_MEALS.get(meal_key, (MEAL_LABELS.get(meal_key, meal_key), 0))[0]
+
+
+def nutrition_rules_by_food(rows):
+    grouped = {}
+    for row in rows:
+        item = grouped.setdefault(int(row["food_id"]), {"row": row, "rules": []})
+        if row["enabled"]:
+            item["rules"].append(MealFoodRule(
+                meal_key=row["meal_key"], minimum=float(row["minimum"]), maximum=float(row["maximum"]),
+                step=float(row["step"]), preferred=float(row["preferred"]) if row["preferred"] is not None else None,
+            ))
+    return grouped
+
+
+async def nutrition_settings_text(profile_id: int, diet_type: str, owner_id: int):
+    rows = await db.nutrition_rules(profile_id, diet_type, owner_id)
+    counts = {key: sum(1 for row in rows if row["meal_key"] == key and row["enabled"]) for key in NUTRITION_MEALS}
+    kind = "тренувальний" if diet_type == DIET_TRAINING else "звичайний"
+    text = (
+        f"🤖 <b>Генератор раціону · {kind}</b>\n\n"
+        "Спочатку позначте, які продукти можна ставити в кожен прийом їжі. Це жорсткі правила: наприклад, якщо гречку не дозволити на сніданок, генератор її туди не поставить.\n\n"
+        "Для кожного вибраного продукту можна налаштувати межі порції, крок і основу ваги. Дозволені крупи й макарони бот чергуватиме за днями, обираючи одну на прийом їжі. Поживність береться з бази: обирайте суху/сиру/готову вагу відповідно до того, для якого стану продукту внесені його КБЖВ. Чернетка не змінює щоденник, доки ви її не підтвердите."
+    )
+    markup_rows = [
+        [(f"{label} · {counts[key]} продуктів", f"nutrition:meal:{diet_type}:{key}")]
+        for key, (label, _) in NUTRITION_MEALS.items()
+    ]
+    markup_rows.extend([
+        [("📐 Межі порцій і основа ваги", f"nutrition:bounds-list:{diet_type}")],
+        [("✨ Згенерувати на сьогодні", f"nutrition:generate:{diet_type}")],
+        [("← До раціону", f"food:{diet_type}")],
+    ])
+    return text, buttons(markup_rows)
+
+
+@router.callback_query(F.data.startswith("nutrition:menu:"))
+async def nutrition_planner_menu(callback: CallbackQuery) -> None:
+    if not await nutrition_planner_access(callback):
+        return
+    diet_type = callback.data.rsplit(":", 1)[1]
+    if diet_type not in {DIET_REST, DIET_TRAINING}:
+        await callback.answer("Невідомий тип раціону.", show_alert=True)
+        return
+    profile = await account_profile(callback.from_user.id)
+    if profile["diet_mode"] == "auto":
+        text, markup = await nutrition_auto_settings_screen(profile, await db.food_owner(callback.from_user.id))
+        await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+        await callback.answer()
+        return
+    if profile["diet_mode"] != "split":
+        diet_type = DIET_REST
+    owner_id = await db.food_owner(callback.from_user.id)
+    text, markup = await nutrition_settings_text(profile["id"], diet_type, owner_id)
+    await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("nutrition:meal:"))
+async def nutrition_planner_meal(callback: CallbackQuery) -> None:
+    if not await nutrition_planner_access(callback):
+        return
+    try:
+        _, _, diet_type, meal_key = callback.data.split(":")
+    except ValueError:
+        await callback.answer("Некоректний прийом їжі.", show_alert=True)
+        return
+    if diet_type not in {DIET_REST, DIET_TRAINING} or meal_key not in NUTRITION_MEALS:
+        await callback.answer("Невідомий прийом їжі.", show_alert=True)
+        return
+    profile = await account_profile(callback.from_user.id)
+    owner_id = await db.food_owner(callback.from_user.id)
+    foods = await db.foods(owner_id)
+    rules = await db.nutrition_rules(profile["id"], diet_type, owner_id)
+    selected = {int(row["food_id"]) for row in rules if row["meal_key"] == meal_key and row["enabled"]}
+    rows = [
+        [(f"{'✅' if food['id'] in selected else '▫️'} {food['name'][:48]}", f"nutrition:toggle:{diet_type}:{meal_key}:{food['id']}")]
+        for food in foods
+    ]
+    rows.extend([
+        [("📐 Налаштувати порції та вагу", f"nutrition:bounds-list:{diet_type}")],
+        [("← До налаштувань генератора", f"nutrition:menu:{diet_type}")],
+    ])
+    text = f"{nutrition_meal_label(meal_key)}\n\nНатискайте продукти, щоб дозволити або заборонити їх у цьому прийомі їжі.\n\nДля сніданку можна, наприклад, вибрати вівсянку, яйця й банан, залишивши рис і гречку вимкненими."
+    await callback.message.edit_text(text, reply_markup=buttons(rows), parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("nutrition:toggle:"))
+async def nutrition_planner_toggle(callback: CallbackQuery) -> None:
+    if not await nutrition_planner_access(callback):
+        return
+    try:
+        _, _, diet_type, meal_key, food_id_text = callback.data.split(":")
+        food_id = int(food_id_text)
+    except ValueError:
+        await callback.answer("Некоректний продукт.", show_alert=True)
+        return
+    profile = await account_profile(callback.from_user.id)
+    owner_id = await db.food_owner(callback.from_user.id)
+    rows = await db.nutrition_rules(profile["id"], diet_type, owner_id)
+    enabled = any(int(row["food_id"]) == food_id and row["meal_key"] == meal_key and row["enabled"] for row in rows)
+    try:
+        await db.set_nutrition_food_enabled(profile["id"], food_id, diet_type, meal_key, not enabled, owner_id)
+    except ValueError as exc:
+        await callback.answer(str(exc), show_alert=True)
+        return
+    foods = await db.foods(owner_id)
+    rules = await db.nutrition_rules(profile["id"], diet_type, owner_id)
+    selected = {int(row["food_id"]) for row in rules if row["meal_key"] == meal_key and row["enabled"]}
+    keyboard_rows = [
+        [(f"{'✅' if food['id'] in selected else '▫️'} {food['name'][:48]}", f"nutrition:toggle:{diet_type}:{meal_key}:{food['id']}")]
+        for food in foods
+    ]
+    keyboard_rows.extend([
+        [("📐 Налаштувати порції та вагу", f"nutrition:bounds-list:{diet_type}")],
+        [("← До налаштувань генератора", f"nutrition:menu:{diet_type}")],
+    ])
+    await callback.message.edit_reply_markup(reply_markup=buttons(keyboard_rows))
+    await callback.answer("Продукт дозволено." if not enabled else "Продукт заборонено.")
+
+
+@router.callback_query(F.data.startswith("nutrition:bounds-list:"))
+async def nutrition_planner_bounds_list(callback: CallbackQuery) -> None:
+    if not await nutrition_planner_access(callback):
+        return
+    diet_type = callback.data.rsplit(":", 1)[1]
+    if diet_type not in {DIET_REST, DIET_TRAINING}:
+        await callback.answer("Невідомий тип раціону.", show_alert=True)
+        return
+    profile = await account_profile(callback.from_user.id)
+    owner_id = await db.food_owner(callback.from_user.id)
+    rows = [row for row in await db.nutrition_rules(profile["id"], diet_type, owner_id) if row["enabled"]]
+    keyboard_rows = [
+        [(f"{nutrition_meal_label(row['meal_key'])} · {row['name'][:24]} · до {row['maximum']:g} {row['unit']}", f"nutrition:rule:{diet_type}:{row['meal_key']}:{row['food_id']}")]
+        for row in rows
+    ]
+    keyboard_rows.extend([
+        [("← До налаштувань генератора", f"nutrition:menu:{diet_type}")],
+    ])
+    diet_label = "тренувальний" if diet_type == DIET_TRAINING else "звичайний"
+    text = f"📐 <b>Порції та основа ваги · {diet_label} раціон</b>\n\nМежі зберігаються окремо для кожного продукту в кожному прийомі їжі. Виберіть рядок із потрібною назвою прийому їжі. Початковий максимум для продуктів у грамах/мл — 150 одиниць, для штук — 4."
+    if not rows:
+        text += "\n\nСпочатку виберіть продукти для сніданку, обіду або вечері."
+    await callback.message.edit_text(text, reply_markup=buttons(keyboard_rows), parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("nutrition:rule:"))
+async def nutrition_planner_rule(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await nutrition_planner_access(callback):
+        return
+    await state.clear()
+    try:
+        _, _, diet_type, meal_key, food_id_text = callback.data.split(":")
+        food_id = int(food_id_text)
+    except ValueError:
+        await callback.answer("Некоректні параметри продукту.", show_alert=True)
+        return
+    profile = await account_profile(callback.from_user.id)
+    owner_id = await db.food_owner(callback.from_user.id)
+    row = next((item for item in await db.nutrition_rules(profile["id"], diet_type, owner_id) if int(item["food_id"]) == food_id and item["meal_key"] == meal_key and item["enabled"]), None)
+    if not row:
+        await callback.answer("Продукт не вибрано.", show_alert=True)
+        return
+    basis = NUTRITION_BASES.get(row["weight_basis"], NUTRITION_BASES["database"])
+    diet_label = "тренувальний" if diet_type == DIET_TRAINING else "звичайний"
+    text = (
+        f"📐 <b>{escape(row['name'])}</b> · {nutrition_meal_label(meal_key)} · {diet_label} раціон\n\n"
+        f"Порція: {row['minimum']:g}–{row['maximum']:g} {row['unit']} · крок {row['step']:g}\n"
+        f"Основа ваги: {basis}.\n\n"
+        "Крок має бути цілим для яєць. Для круп зазначайте суху вагу, для м’яса — сиру."
+    )
+    markup_rows = [
+        [("✏️ Змінити межі й крок", f"nutrition:bounds-edit:{diet_type}:{meal_key}:{food_id}")],
+    ]
+    if row["unit"] == "шт":
+        markup_rows.append([("⚖️ Вага: штуки", f"nutrition:basis:{diet_type}:{food_id}:piece")])
+    else:
+        markup_rows.extend([
+            [("🥣 Суха вага", f"nutrition:basis:{diet_type}:{food_id}:dry"), ("🥩 Сира вага", f"nutrition:basis:{diet_type}:{food_id}:raw")],
+            [("🍲 Готова вага", f"nutrition:basis:{diet_type}:{food_id}:cooked"), ("📦 Як у базі", f"nutrition:basis:{diet_type}:{food_id}:database")],
+        ])
+    markup_rows.append([("← До списку порцій", f"nutrition:bounds-list:{diet_type}")])
+    await callback.message.edit_text(text, reply_markup=buttons(markup_rows), parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("nutrition:basis:"))
+async def nutrition_planner_basis(callback: CallbackQuery) -> None:
+    if not await nutrition_planner_access(callback):
+        return
+    try:
+        _, _, diet_type, food_id_text, basis = callback.data.split(":")
+        food_id = int(food_id_text)
+    except ValueError:
+        await callback.answer("Некоректна основа ваги.", show_alert=True)
+        return
+    profile = await account_profile(callback.from_user.id)
+    owner_id = await db.food_owner(callback.from_user.id)
+    updated = await db.set_nutrition_weight_basis(profile["id"], food_id, basis, owner_id)
+    if not updated:
+        await callback.answer("Спочатку виберіть продукт для генератора.", show_alert=True)
+        return
+    rows = [row for row in await db.nutrition_rules(profile["id"], diet_type, owner_id) if row["enabled"]]
+    keyboard_rows = [
+        [(f"{nutrition_meal_label(row['meal_key'])} · {row['name'][:24]} · до {row['maximum']:g} {row['unit']}", f"nutrition:rule:{diet_type}:{row['meal_key']}:{row['food_id']}")]
+        for row in rows
+    ]
+    keyboard_rows.append([("← До налаштувань генератора", f"nutrition:menu:{diet_type}")])
+    diet_label = "тренувальний" if diet_type == DIET_TRAINING else "звичайний"
+    await callback.message.edit_text(f"📐 <b>Порції та основа ваги · {diet_label} раціон</b>\n\nОснова ваги збережена. Межі порцій показані окремо для кожного прийому їжі.", reply_markup=buttons(keyboard_rows), parse_mode="HTML")
+    await callback.answer("Основу ваги збережено.")
+
+
+@router.callback_query(F.data.startswith("nutrition:bounds-edit:"))
+async def nutrition_planner_bounds_edit(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await nutrition_planner_access(callback):
+        return
+    try:
+        _, _, diet_type, meal_key, food_id_text = callback.data.split(":")
+        food_id = int(food_id_text)
+    except ValueError:
+        await callback.answer("Некоректні параметри порції.", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(InputFlow.nutrition_plan_portions)
+    await state.update_data(nutrition_rule={"diet_type": diet_type, "meal_key": meal_key, "food_id": food_id})
+    await callback.message.edit_text(
+        "Введіть мінімум, максимум і крок порції через пробіл. Наприклад: <code>0 120 5</code>. Для продукту в штуках — цілі значення з кроком 1, наприклад <code>0 4 1</code>.",
+        reply_markup=buttons([[('✖️ Скасувати', f"nutrition:rule:{diet_type}:{meal_key}:{food_id}")]]),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.message(InputFlow.nutrition_plan_portions)
+async def nutrition_planner_bounds_received(message: Message, state: FSMContext) -> None:
+    if await access_denied(message):
+        return
+    if not await may_manage_diet(message.from_user.id):
+        await state.clear()
+        await message.answer("Керувати генератором може власник або коуч.")
+        return
+    data = await state.get_data()
+    rule = data.get("nutrition_rule", {})
+    values = (message.text or "").split()
+    try:
+        if len(values) != 3:
+            raise ValueError
+        minimum, maximum, step = (parse_number(value) for value in values)
+        profile = await account_profile(message.from_user.id)
+        owner_id = await db.food_owner(message.from_user.id)
+        await db.update_nutrition_food_rule(profile["id"], int(rule["food_id"]), rule["diet_type"], rule["meal_key"], minimum, maximum, step, owner_id)
+    except (ValueError, KeyError) as exc:
+        await message.answer(str(exc) or "Введіть три числа: мінімум, максимум і крок.")
+        return
+    await state.clear()
+    rows = await db.nutrition_rules(profile["id"], rule["diet_type"], owner_id)
+    selected = next((item for item in rows if int(item["food_id"]) == int(rule["food_id"]) and item["meal_key"] == rule["meal_key"]), None)
+    if not selected:
+        await message.answer("Не знайшов це правило. Відкрийте налаштування порцій і виберіть продукт ще раз.")
+        return
+    await message.answer(
+        f"✅ Межі збережено: {selected['name']} · {nutrition_meal_label(rule['meal_key'])} — {selected['minimum']:g}–{selected['maximum']:g} {selected['unit']}, крок {selected['step']:g}.",
+        reply_markup=buttons([[('← До порцій', f"nutrition:bounds-list:{rule['diet_type']}")]]),
+    )
+
+
+@router.callback_query(F.data.startswith("nutrition:generate:"))
+async def nutrition_plan_generate(callback: CallbackQuery) -> None:
+    if not await nutrition_planner_access(callback):
+        return
+    diet_type = callback.data.rsplit(":", 1)[1]
+    if diet_type not in {DIET_REST, DIET_TRAINING}:
+        await callback.answer("Невідомий тип раціону.", show_alert=True)
+        return
+    profile = await account_profile(callback.from_user.id)
+    if profile["diet_mode"] == "auto":
+        await nutrition_auto_generate(callback)
+        return
+    if profile["diet_mode"] != "split":
+        diet_type = DIET_REST
+    owner_id = await db.food_owner(callback.from_user.id)
+    rules = [row for row in await db.nutrition_rules(profile["id"], diet_type, owner_id) if row["enabled"]]
+    grouped = nutrition_rules_by_food(rules)
+    today = local_today()
+    foods = []
+    for food_id, item in grouped.items():
+        row = item["row"]
+        if not item["rules"]:
+            continue
+        foods.append(FoodOption(
+            product_id=food_id, name=row["name"], unit=row["unit"],
+            calories=float(row["calories"]), protein=float(row["protein"]), fat=float(row["fat"]), carbs=float(row["carbs"]),
+            rules=tuple(item["rules"]), weight_basis=row["weight_basis"],
+        ))
+    foods = list(rotate_grains_by_date(foods, today))
+    enabled_meals = {rule.meal_key for food in foods for rule in food.rules}
+    meal_options = [MealOption(key, share, required=True) for key, (_, share) in NUTRITION_MEALS.items() if key != "snack"]
+    if "snack" in enabled_meals:
+        meal_options = [
+            MealOption("breakfast", 25), MealOption("lunch", 30),
+            MealOption("dinner", 30), MealOption("snack", 15, required=False),
+        ]
+    weight, activity, warning = await source_values(profile, diet_type, today)
+    calculated_targets = calculate_targets(profile, weight, activity)
+    targets = {
+        "calories": float(calculated_targets["total"]),
+        "protein": float(calculated_targets["protein"]),
+        "fat": float(calculated_targets["fat"]),
+        "carbs": float(calculated_targets["carbs"]),
+    }
+    try:
+        result = generate_day_plan(foods, targets, meal_options)
+    except (ValueError, KeyError) as exc:
+        await callback.answer(f"Не вдалося скласти меню: {exc}", show_alert=True)
+        return
+    if result.status not in {"optimal", "feasible"} or not result.items or not result.totals:
+        await callback.message.edit_text(
+            "⚠️ <b>Не вдалося скласти допустимий раціон</b>\n\n" + (result.message or "Перевірте продукти для кожного обов’язкового прийому їжі."),
+            reply_markup=buttons([[('📐 Налаштувати продукти й порції', f"nutrition:menu:{diet_type}")], [('← До раціону', f"food:{diet_type}")]]),
+            parse_mode="HTML",
+        )
+        await callback.answer()
+        return
+
+    totals = result.totals
+    target_values = result.targets or {key: float(targets[key]) for key in ("calories", "protein", "fat", "carbs")}
+    lines = [
+        f"🧠 <b>Чернетка раціону · {today.strftime('%d.%m.%Y')}</b>",
+        "",
+        f"Цілі: {target_values['calories']:.0f} ккал · Б {target_values['protein']:.0f} г · Ж {target_values['fat']:.0f} г · В {target_values['carbs']:.0f} г",
+    ]
+    for meal in meal_options:
+        meal_items = [item for item in result.items if item.meal == meal.key]
+        if not meal_items:
+            continue
+        lines.extend(("", f"<b>{nutrition_meal_label(meal.key)}</b>"))
+        for item in meal_items:
+            basis = NUTRITION_BASES.get(item.weight_basis, NUTRITION_BASES["database"])
+            suffix = f" · {basis}" if item.weight_basis != "database" else ""
+            lines.append(f"• {escape(item.name)} — {item.quantity:g} {item.unit}{suffix}")
+    lines.extend((
+        "",
+        f"<b>Разом:</b> {totals['calories']:.0f} ккал · Б {totals['protein']:.1f} г · Ж {totals['fat']:.1f} г · В {totals['carbs']:.1f} г",
+        f"Відхилення: {totals['calories'] - target_values['calories']:+.0f} ккал · Б {totals['protein'] - target_values['protein']:+.1f} г · Ж {totals['fat'] - target_values['fat']:+.1f} г · В {totals['carbs'] - target_values['carbs']:+.1f} г",
+        "",
+        "Це чернетка, вона ще не записана як з’їдена їжа.",
+    ))
+    if warning:
+        lines.extend(("", escape(warning)))
+    draft_id = await db.save_nutrition_plan_draft(
+        profile["id"], diet_type, today.isoformat(),
+        [{"product_id": item.product_id, "meal": nutrition_meal_label(item.meal), "quantity": item.quantity, "unit": item.unit} for item in result.items],
+        totals, target_values,
+    )
+    await callback.message.edit_text(
+        "\n".join(lines),
+        reply_markup=buttons([
+            [("✅ Додати до фактичного раціону", f"nutrition:apply:{draft_id}")],
+            [("🔄 Згенерувати ще раз", f"nutrition:generate:{diet_type}")],
+            [("📐 Налаштування генератора", f"nutrition:menu:{diet_type}")],
+            [("← До раціону", f"food:{diet_type}")],
+        ]),
+        parse_mode="HTML",
+    )
+    await callback.answer("Чернетку готово.")
+
+
+@router.callback_query(F.data.startswith("nutrition:apply:"))
+async def nutrition_plan_apply(callback: CallbackQuery) -> None:
+    if not await nutrition_planner_access(callback):
+        return
+    try:
+        draft_id = int(callback.data.rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Чернетку не знайдено.", show_alert=True)
+        return
+    profile = await account_profile(callback.from_user.id)
+    try:
+        applied = await db.apply_nutrition_plan_draft(profile["id"], draft_id, local_today().isoformat())
+    except Exception:
+        logging.exception("Failed to apply generated nutrition plan for profile %s", profile["id"])
+        await callback.answer("Не вдалося додати план. Фактичний раціон не змінено.", show_alert=True)
+        return
+    if not applied:
+        await callback.answer("Цей план уже доданий або він не на сьогодні.", show_alert=True)
+        return
+    draft = await db.nutrition_plan_draft(profile["id"], draft_id)
+    diet_type = draft["diet_type"]
+    text, markup = await food_screen(callback.from_user.id, diet_type)
+    await callback.message.edit_text(
+        "✅ Новий план записано замість попереднього згенерованого меню на цей день. Ручні записи збережено. Перевірте раціон і за потреби змініть порції.\n\n" + text,
+        reply_markup=markup,
+    )
+    await callback.answer("Раціон оновлено.")
 
 
 async def shopping_list_screen(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     profile = await account_profile(user_id)
     today = local_today()
+    if profile["diet_mode"] == "auto":
+        plan_row = await db.nutrition_auto_week_plan_for_date(profile["id"], today.isoformat())
+        if plan_row:
+            plan_row, days, _ = await refresh_custom_nutrition_week(profile, await db.food_owner(user_id), plan_row)
+            totals: dict[tuple[int, str], dict[str, Any]] = {}
+            for day in days:
+                if day.get("applied") or date.fromisoformat(day["date"]) < today:
+                    continue
+                for item in day.get("items", []):
+                    key = (int(item["product_id"]), str(item["unit"]))
+                    if key not in totals:
+                        totals[key] = {"name": item["name"], "unit": item["unit"], "quantity": 0.0}
+                    totals[key]["quantity"] += float(item["quantity"])
+            start = date.fromisoformat(plan_row["start_date"])
+            end = date.fromisoformat(plan_row["end_date"])
+            lines = [f"🛒 <b>Список покупок · план {start.strftime('%d.%m')}–{end.strftime('%d.%m.%Y')}</b>", "", "Кількості для сьогоднішнього й майбутніх днів, які ще не додані до щоденника."]
+            if totals:
+                lines.extend(["", "<b>Купити:</b>"])
+                for item in sorted(totals.values(), key=lambda entry: str(entry["name"]).casefold()):
+                    lines.append(f"• {escape(str(item['name']))} — {float(item['quantity']):g} {escape(str(item['unit']))}")
+            else:
+                lines.extend(["", "У плані не залишилося майбутніх меню для покупок."])
+            return "\n".join(lines), buttons([
+                [("📋 Відкрити план", f"nutrition:auto:week:view:{plan_row['id']}")],
+                [("← До спорту і раціону", "sport:menu")],
+            ])
+        return (
+            "🛒 <b>Список покупок</b>\n\nСпочатку створіть план автоматичного раціону на 7 днів.",
+            buttons([[('🗓 Створити план на 7 днів', 'nutrition:auto:week:generate')], [('← До спорту і раціону', 'sport:menu')]]),
+        )
     week_days = [today + timedelta(days=offset) for offset in range(7)]
-    split_mode = profile["diet_mode"] == "split"
+    split_mode = profile["diet_mode"] in {"split", "auto"}
     selected_weekdays = saved_training_weekdays(profile) if split_mode else []
     auto_schedule_note = ""
 
@@ -1372,7 +2594,7 @@ async def admin_user(callback: CallbackQuery) -> None:
         profiles = await db.profiles(user_id)
     profile = await admin_target_profile(user_id, profiles)
     status = {"approved": "схвалений", "pending": "очікує", "rejected": "відхилений", "banned": "заблокований"}.get(account["access_status"], account["access_status"])
-    diet_mode = "окремі раціони: тренувальний + звичайний" if profile["diet_mode"] == "split" else "один раціон"
+    diet_mode = {"single": "один раціон", "split": "два раціони", "auto": "автоматичний раціон"}.get(profile["diet_mode"], "один раціон")
     username = f"@{account['username']}" if account["username"] else "не задано"
     display_name = " ".join(part for part in (account["first_name"], account["last_name"]) if part) or "не вказане"
     text = (
@@ -1391,6 +2613,7 @@ async def admin_user(callback: CallbackQuery) -> None:
         actions.append([("🎯 Набір", f"adm:mode:{user_id}:набір"), ("⚖️ Підтримання", f"adm:mode:{user_id}:підтримання")])
         actions.append([("🔥 Схуднення", f"adm:mode:{user_id}:схуднення")])
         actions.append([("🍽 Один раціон", f"adm:dietmode:{user_id}:single"), ("🏋️ Два раціони", f"adm:dietmode:{user_id}:split")])
+        actions.append([("🤖 Автоматичний раціон", f"adm:dietmode:{user_id}:auto")])
     if account["access_status"] in {"pending", "rejected"}:
         actions.append([("✅ Схвалити", f"adm:approve:{user_id}")])
     if account["access_status"] == "approved":
@@ -1414,9 +2637,10 @@ async def admin_action(callback: CallbackQuery) -> None:
         parts = callback.data.split(":")
         user_id = int(parts[2])
         mode = parts[3] if len(parts) > 3 else None
-        if mode not in {"single", "split"}:
+        if mode not in {"single", "split", "auto"}:
             await callback.message.edit_text("🍽 Оберіть режим раціонів:", reply_markup=buttons([
                 [("🍽 Один раціон", f"adm:dietmode:{user_id}:single"), ("🏋️ Два раціони", f"adm:dietmode:{user_id}:split")],
+                [("🤖 Автоматичний раціон", f"adm:dietmode:{user_id}:auto")],
                 [("← До адмін-панелі", "admin")],
             ]))
             await callback.answer()
@@ -1531,10 +2755,13 @@ def training_days_text(profile) -> str:
         current = "Зараз: " + ", ".join(WEEKDAY_LABELS[day] for day in selected) + "."
     else:
         current = "Зараз: днів тренування не вибрано; щодня діє звичайний раціон."
+    if profile["diet_mode"] == "auto":
+        instruction = "У ці дні бот автоматично застосовуватиме тренувальну ціль. Налаштування продуктів і прийомів їжі спільні для всіх днів."
+    else:
+        instruction = "У ці дні бот використовуватиме тренувальний раціон, а в інші — звичайний."
     return (
         "🗓 <b>Дні тренувань</b>\n\n"
-        "Оберіть дні тижня, коли використовувати тренувальний раціон. "
-        "В інші дні підсумок враховуватиме звичайний раціон.\n\n"
+        f"Оберіть дні тижня. {instruction}\n\n"
         f"{current}\n\nНатискайте на день, щоб увімкнути або вимкнути його."
     )
 
@@ -1543,7 +2770,7 @@ def training_days_text(profile) -> str:
 async def profile_callback(callback: CallbackQuery) -> None:
     profile = await account_profile(callback.from_user.id)
     manual = "🖐️ Ручний режим: УВІМКНЕНО" if profile["manual_mode"] else "📡 Авторежим (з експорту здоровʼя)"
-    diet_mode = "один раціон" if profile["diet_mode"] == "single" else "тренувальний + звичайний"
+    diet_mode = {"single": "один раціон", "split": "тренувальний + звичайний", "auto": "автоматичне меню"}.get(profile["diet_mode"], "один раціон")
     text = (
         f"👤 <b>Профіль · {profile['name']}</b>\n"
         f"━━━━━━━━━━━━━━\n"
@@ -1569,7 +2796,7 @@ async def profile_callback(callback: CallbackQuery) -> None:
         [('✏️ Білок/кг', 'edit:protein_per_kg'), ('✏️ Жири/кг', 'edit:fat_per_kg')],
         [('✏️ Профіцит/дефіцит', 'edit:surplus_deficit')],
     ])
-    if profile["diet_mode"] == "split":
+    if profile["diet_mode"] in {"split", "auto"}:
         selected = saved_training_weekdays(profile)
         if selected is None:
             text += "\n🗓 Дні тренувань: автовизначення за активністю"
@@ -1588,8 +2815,8 @@ async def training_days_menu(callback: CallbackQuery) -> None:
     if await access_denied(callback):
         return
     profile = await account_profile(callback.from_user.id)
-    if profile["diet_mode"] != "split":
-        await callback.answer("Перемикніть профіль на два раціони, щоб налаштувати дні тренувань.", show_alert=True)
+    if profile["diet_mode"] not in {"split", "auto"}:
+        await callback.answer("Налаштування доступне в режимах «Два раціони» та «Автоматичне меню».", show_alert=True)
         return
     await callback.message.edit_text(training_days_text(profile), reply_markup=training_days_keyboard(profile), parse_mode="HTML")
     await callback.answer()
@@ -1600,8 +2827,8 @@ async def training_days_toggle(callback: CallbackQuery) -> None:
     if await access_denied(callback):
         return
     profile = await account_profile(callback.from_user.id)
-    if profile["diet_mode"] != "split":
-        await callback.answer("Налаштування днів доступне лише для двох раціонів.", show_alert=True)
+    if profile["diet_mode"] not in {"split", "auto"}:
+        await callback.answer("Налаштування днів доступне в режимах «Два раціони» та «Автоматичне меню».", show_alert=True)
         return
     try:
         day = int(callback.data.rsplit(":", 1)[1])
@@ -1623,8 +2850,8 @@ async def training_days_auto(callback: CallbackQuery) -> None:
     if await access_denied(callback):
         return
     profile = await account_profile(callback.from_user.id)
-    if profile["diet_mode"] != "split":
-        await callback.answer("Налаштування доступне лише для двох раціонів.", show_alert=True)
+    if profile["diet_mode"] not in {"split", "auto"}:
+        await callback.answer("Налаштування доступне в режимах «Два раціони» та «Автоматичне меню».", show_alert=True)
         return
     await db.update_profile(profile["id"], training_weekdays=None)
     profile = await account_profile(callback.from_user.id)
@@ -1727,8 +2954,9 @@ async def food_callback(callback: CallbackQuery) -> None:
     if await access_denied(callback):
         return
     profile = await account_profile(callback.from_user.id)
-    if profile["diet_mode"] == "single":
-        text, markup = await food_screen(callback.from_user.id, DIET_REST)
+    if profile["diet_mode"] in {"single", "auto"}:
+        diet_type = DIET_TRAINING if profile["diet_mode"] == "auto" and await current_day_is_training(profile) else DIET_REST
+        text, markup = await food_screen(callback.from_user.id, diet_type)
         await callback.message.edit_text(text, reply_markup=markup)
         await callback.answer()
         return
@@ -1755,6 +2983,8 @@ async def selected_food_callback(callback: CallbackQuery) -> None:
     profile = await account_profile(callback.from_user.id)
     if profile["diet_mode"] == "single":
         diet_type = DIET_REST
+    elif profile["diet_mode"] == "auto":
+        diet_type = DIET_TRAINING if await current_day_is_training(profile) else DIET_REST
     text, markup = await food_screen(callback.from_user.id, diet_type)
     await callback.message.edit_text(text, reply_markup=markup)
     await callback.answer()

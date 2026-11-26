@@ -33,6 +33,7 @@ COUNT_TABLES = {
     "telegram_accounts", "profiles", "food_database", "food_log", "activity_log", "weight_log", "sleep_log",
     "finance_transactions", "finance_category_budget_groups", "goals", "habits", "habit_logs", "reflection_entries", "weekly_reflections",
     "training_programs", "training_sessions", "training_exercise_logs",
+    "nutrition_food_rules", "nutrition_auto_meals", "nutrition_auto_food_rules", "nutrition_auto_week_plans", "nutrition_plan_drafts",
 }
 
 

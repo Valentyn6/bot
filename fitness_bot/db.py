@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS profiles (
     deficit_loss REAL NOT NULL DEFAULT 400,
     diet_mode TEXT NOT NULL DEFAULT 'single',
     training_weekdays TEXT,
+    nutrition_allow_duplicates INTEGER NOT NULL DEFAULT 1,
     protein_per_kg REAL NOT NULL DEFAULT 2,
     fat_per_kg REAL NOT NULL DEFAULT 1,
     manual_mode INTEGER NOT NULL DEFAULT 0,
@@ -97,6 +98,7 @@ CREATE TABLE IF NOT EXISTS food_log (
     product_id INTEGER NOT NULL,
     quantity REAL NOT NULL,
     created_at TEXT NOT NULL,
+    source_plan_id INTEGER,
     FOREIGN KEY(profile_id) REFERENCES profiles(id) ON DELETE CASCADE,
     FOREIGN KEY(product_id) REFERENCES food_database(id)
 );
@@ -108,6 +110,68 @@ CREATE TABLE IF NOT EXISTS meal_templates (
     UNIQUE(profile_id, name),
     FOREIGN KEY(profile_id) REFERENCES profiles(id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS nutrition_food_rules (
+    profile_id INTEGER NOT NULL,
+    food_id INTEGER NOT NULL,
+    diet_type TEXT NOT NULL,
+    meal_key TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    minimum REAL NOT NULL DEFAULT 0,
+    maximum REAL NOT NULL DEFAULT 150,
+    step REAL NOT NULL DEFAULT 5,
+    preferred REAL,
+    weight_basis TEXT NOT NULL DEFAULT 'database',
+    PRIMARY KEY(profile_id, food_id, diet_type, meal_key),
+    FOREIGN KEY(profile_id) REFERENCES profiles(id) ON DELETE CASCADE,
+    FOREIGN KEY(food_id) REFERENCES food_database(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS nutrition_auto_meals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    position INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(profile_id, name),
+    FOREIGN KEY(profile_id) REFERENCES profiles(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS nutrition_auto_food_rules (
+    profile_id INTEGER NOT NULL,
+    meal_id INTEGER NOT NULL,
+    food_id INTEGER NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    minimum REAL NOT NULL DEFAULT 0,
+    maximum REAL NOT NULL DEFAULT 150,
+    step REAL NOT NULL DEFAULT 5,
+    preferred REAL,
+    weight_basis TEXT NOT NULL DEFAULT 'database',
+    PRIMARY KEY(profile_id, meal_id, food_id),
+    FOREIGN KEY(profile_id) REFERENCES profiles(id) ON DELETE CASCADE,
+    FOREIGN KEY(meal_id) REFERENCES nutrition_auto_meals(id) ON DELETE CASCADE,
+    FOREIGN KEY(food_id) REFERENCES food_database(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS nutrition_auto_week_plans (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_id INTEGER NOT NULL,
+    start_date TEXT NOT NULL,
+    end_date TEXT NOT NULL,
+    days_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(profile_id, start_date),
+    FOREIGN KEY(profile_id) REFERENCES profiles(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS nutrition_plan_drafts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_id INTEGER NOT NULL,
+    diet_type TEXT NOT NULL,
+    plan_date TEXT NOT NULL,
+    items_json TEXT NOT NULL,
+    totals_json TEXT NOT NULL,
+    targets_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    applied_at TEXT,
+    FOREIGN KEY(profile_id) REFERENCES profiles(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_nutrition_rules_profile_diet ON nutrition_food_rules(profile_id, diet_type, meal_key, enabled);
 CREATE TABLE IF NOT EXISTS weight_log (
     profile_id INTEGER NOT NULL,
     log_date TEXT NOT NULL,
@@ -390,6 +454,10 @@ class Database:
         await self._migrate_accounts()
         await self._migrate_activity_log()
         await self._migrate_food_log()
+        food_log_columns = {row[1] for row in await (await self._db().execute("PRAGMA table_info(food_log)")).fetchall()}
+        if "source_plan_id" not in food_log_columns:
+            await self._db().execute("ALTER TABLE food_log ADD COLUMN source_plan_id INTEGER")
+        await self._db().execute("CREATE INDEX IF NOT EXISTS idx_food_log_source_plan ON food_log(source_plan_id)")
         await self._migrate_profiles()
         await self._migrate_finance_categories()
         await self._migrate_finance_auto_rules()
@@ -443,6 +511,8 @@ class Database:
             await self._db().execute("ALTER TABLE profiles ADD COLUMN diet_mode TEXT NOT NULL DEFAULT 'single'")
         if "training_weekdays" not in columns:
             await self._db().execute("ALTER TABLE profiles ADD COLUMN training_weekdays TEXT")
+        if "nutrition_allow_duplicates" not in columns:
+            await self._db().execute("ALTER TABLE profiles ADD COLUMN nutrition_allow_duplicates INTEGER NOT NULL DEFAULT 1")
 
     async def _migrate_finance_accounts(self) -> None:
         columns = {row[1] for row in await (await self._db().execute("PRAGMA table_info(finance_accounts)")).fetchall()}
@@ -685,7 +755,7 @@ class Database:
         return await (await self._db().execute("SELECT * FROM profiles WHERE owner_telegram_id=? ORDER BY id", (owner_id,))).fetchall()
 
     async def update_profile(self, profile_id: int, **values: Any) -> None:
-        allowed = {"name", "height", "age", "sex", "target_weight", "goal_mode", "surplus_deficit", "surplus_gain", "surplus_maintenance", "deficit_loss", "diet_mode", "training_weekdays", "protein_per_kg", "fat_per_kg", "manual_mode", "manual_weight", "manual_activity", "workout_kcal_today"}
+        allowed = {"name", "height", "age", "sex", "target_weight", "goal_mode", "surplus_deficit", "surplus_gain", "surplus_maintenance", "deficit_loss", "diet_mode", "training_weekdays", "nutrition_allow_duplicates", "protein_per_kg", "fat_per_kg", "manual_mode", "manual_weight", "manual_activity", "workout_kcal_today"}
         values = {key: value for key, value in values.items() if key in allowed}
         if not values:
             return
@@ -755,6 +825,302 @@ class Database:
         cur = await db.execute("INSERT INTO food_database(owner_telegram_id, name, protein, fat, carbs, calories, unit, unit_weight) VALUES (:owner, :name, :protein, :fat, :carbs, :calories, :unit, :unit_weight)", {"owner": owner_id, **values})
         await db.commit()
         return int(cur.lastrowid)
+
+    async def nutrition_rules(self, profile_id: int, diet_type: str, owner_id: int) -> list[aiosqlite.Row]:
+        grain_markers = ("вівсян", "греч", "рис", "булгур", "макарон", "паста", "перлов", "пшоно", "ячн", "кускус", "кус-кус", "кіноа", "злак", "круп")
+        default_case = "CASE WHEN lower(f.name) LIKE '%вівсян%' AND r.meal_key='breakfast' THEN 40 WHEN lower(f.name) LIKE '%рис%' THEN 100 ELSE 80 END"
+        grain_match = " OR ".join("lower(f.name) LIKE ?" for _ in grain_markers)
+        await self._db().execute(
+            "UPDATE nutrition_food_rules AS r SET minimum=" + default_case +
+            " FROM food_database AS f WHERE f.id=r.food_id AND r.profile_id=? AND r.diet_type=? "
+            "AND f.owner_telegram_id=? AND f.unit<>'шт' AND r.minimum=0 AND (" + grain_match + ")",
+            (profile_id, diet_type, owner_id, *(f"%{marker}%" for marker in grain_markers)),
+        )
+        await self._db().commit()
+        return await (await self._db().execute(
+            "SELECT r.*, f.name, f.unit, f.calories, f.protein, f.fat, f.carbs "
+            "FROM nutrition_food_rules r JOIN food_database f ON f.id=r.food_id "
+            "WHERE r.profile_id=? AND r.diet_type=? AND f.owner_telegram_id=? ORDER BY r.meal_key, f.name COLLATE NOCASE",
+            (profile_id, diet_type, owner_id),
+        )).fetchall()
+
+    async def set_nutrition_food_enabled(self, profile_id: int, food_id: int, diet_type: str, meal_key: str, enabled: bool, owner_id: int) -> None:
+        if diet_type not in {"rest", "training"} or meal_key not in {"breakfast", "lunch", "dinner", "snack"}:
+            raise ValueError("Некоректний тип раціону або прийом їжі.")
+        food = await (await self._db().execute(
+            "SELECT name, unit FROM food_database WHERE id=? AND owner_telegram_id=?", (food_id, owner_id),
+        )).fetchone()
+        if not food:
+            raise ValueError("Продукт не знайдено.")
+        default_max, default_step = (4.0, 1.0) if food["unit"] == "шт" else (150.0, 5.0)
+        grain_markers = ("вівсян", "греч", "рис", "булгур", "макарон", "паста", "перлов", "пшоно", "ячн", "кускус", "кус-кус", "кіноа", "злак", "круп")
+        default_min = 0.0
+        if food["unit"] != "шт" and any(marker in food["name"].casefold() for marker in grain_markers):
+            if "вівсян" in food["name"].casefold():
+                default_min = 40.0
+            else:
+                default_min = 100.0 if "рис" in food["name"].casefold() else 80.0
+        default_basis = "piece" if food["unit"] == "шт" else "database"
+        await self._db().execute(
+            "INSERT INTO nutrition_food_rules(profile_id, food_id, diet_type, meal_key, enabled, minimum, maximum, step, weight_basis) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(profile_id, food_id, diet_type, meal_key) DO UPDATE SET enabled=excluded.enabled",
+            (profile_id, food_id, diet_type, meal_key, int(enabled), default_min, default_max, default_step, default_basis),
+        )
+        await self._db().commit()
+
+    async def update_nutrition_food_rule(self, profile_id: int, food_id: int, diet_type: str, meal_key: str, minimum: float, maximum: float, step: float, owner_id: int) -> None:
+        if diet_type not in {"rest", "training"} or meal_key not in {"breakfast", "lunch", "dinner", "snack"}:
+            raise ValueError("Некоректний тип раціону або прийом їжі.")
+        if minimum < 0 or maximum <= 0 or maximum < minimum or maximum > 2000 or step <= 0 or step > maximum:
+            raise ValueError("Перевірте мінімум, максимум і крок порції.")
+        food = await (await self._db().execute(
+            "SELECT unit FROM food_database WHERE id=? AND owner_telegram_id=?", (food_id, owner_id),
+        )).fetchone()
+        if not food:
+            raise ValueError("Продукт не знайдено.")
+        if food["unit"] == "шт" and (step != 1 or not float(minimum).is_integer() or not float(maximum).is_integer()):
+            raise ValueError("Для продукту в штуках використовуйте цілі числа й крок 1.")
+        await self._db().execute(
+            "INSERT INTO nutrition_food_rules(profile_id, food_id, diet_type, meal_key, enabled, minimum, maximum, step) "
+            "VALUES (?, ?, ?, ?, 1, ?, ?, ?) "
+            "ON CONFLICT(profile_id, food_id, diet_type, meal_key) DO UPDATE SET enabled=1, minimum=excluded.minimum, maximum=excluded.maximum, step=excluded.step",
+            (profile_id, food_id, diet_type, meal_key, minimum, maximum, step),
+        )
+        await self._db().commit()
+
+    async def set_nutrition_weight_basis(self, profile_id: int, food_id: int, basis: str, owner_id: int) -> bool:
+        if basis not in {"database", "dry", "raw", "cooked", "piece"}:
+            return False
+        food = await (await self._db().execute(
+            "SELECT unit FROM food_database WHERE id=? AND owner_telegram_id=?", (food_id, owner_id),
+        )).fetchone()
+        if not food or (food["unit"] == "шт" and basis != "piece") or (food["unit"] != "шт" and basis == "piece"):
+            return False
+        cur = await self._db().execute(
+            "UPDATE nutrition_food_rules SET weight_basis=? WHERE profile_id=? AND food_id=? "
+            "AND EXISTS (SELECT 1 FROM food_database WHERE id=? AND owner_telegram_id=?)",
+            (basis, profile_id, food_id, food_id, owner_id),
+        )
+        await self._db().commit()
+        return cur.rowcount > 0
+
+    async def nutrition_auto_meals(self, profile_id: int) -> list[aiosqlite.Row]:
+        return await (await self._db().execute(
+            "SELECT id, profile_id, name, position, 'meal_' || id AS meal_key "
+            "FROM nutrition_auto_meals WHERE profile_id=? ORDER BY position, id",
+            (profile_id,),
+        )).fetchall()
+
+    async def add_nutrition_auto_meal(self, profile_id: int, name: str) -> int:
+        name = " ".join(name.split())
+        if not name or len(name) > 32:
+            raise ValueError("Назва має містити від 1 до 32 символів.")
+        current = await self.nutrition_auto_meals(profile_id)
+        if len(current) >= 8:
+            raise ValueError("Можна створити не більше 8 прийомів їжі.")
+        try:
+            cur = await self._db().execute(
+                "INSERT INTO nutrition_auto_meals(profile_id, name, position) VALUES (?, ?, ?)",
+                (profile_id, name, len(current)),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ValueError("Прийом їжі з такою назвою вже є.") from exc
+        await self._db().commit()
+        return int(cur.lastrowid)
+
+    async def rename_nutrition_auto_meal(self, profile_id: int, meal_id: int, name: str) -> None:
+        name = " ".join(name.split())
+        if not name or len(name) > 32:
+            raise ValueError("Назва має містити від 1 до 32 символів.")
+        try:
+            cur = await self._db().execute(
+                "UPDATE nutrition_auto_meals SET name=? WHERE profile_id=? AND id=?",
+                (name, profile_id, meal_id),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ValueError("Прийом їжі з такою назвою вже є.") from exc
+        if not cur.rowcount:
+            raise ValueError("Прийом їжі не знайдено.")
+        await self._db().commit()
+
+    async def delete_nutrition_auto_meal(self, profile_id: int, meal_id: int) -> bool:
+        row = await (await self._db().execute(
+            "SELECT position FROM nutrition_auto_meals WHERE profile_id=? AND id=?", (profile_id, meal_id),
+        )).fetchone()
+        if not row:
+            return False
+        cur = await self._db().execute(
+            "DELETE FROM nutrition_auto_meals WHERE profile_id=? AND id=?", (profile_id, meal_id),
+        )
+        await self._db().execute(
+            "UPDATE nutrition_auto_meals SET position=position-1 WHERE profile_id=? AND position > ?",
+            (profile_id, int(row["position"])),
+        )
+        await self._db().commit()
+        return cur.rowcount > 0
+
+    async def move_nutrition_auto_meal(self, profile_id: int, meal_id: int, direction: int) -> bool:
+        meals = list(await self.nutrition_auto_meals(profile_id))
+        index = next((i for i, meal in enumerate(meals) if int(meal["id"]) == meal_id), None)
+        target = index + direction if index is not None else -1
+        if direction not in {-1, 1} or index is None or not 0 <= target < len(meals):
+            return False
+        first, second = meals[index], meals[target]
+        await self._db().execute("UPDATE nutrition_auto_meals SET position=? WHERE id=?", (int(second["position"]), int(first["id"])))
+        await self._db().execute("UPDATE nutrition_auto_meals SET position=? WHERE id=?", (int(first["position"]), int(second["id"])))
+        await self._db().commit()
+        return True
+
+    async def nutrition_auto_rules(self, profile_id: int, owner_id: int) -> list[aiosqlite.Row]:
+        return await (await self._db().execute(
+            "SELECT r.*, 'meal_' || m.id AS meal_key, m.name AS meal_name, f.name, f.unit, "
+            "f.calories, f.protein, f.fat, f.carbs "
+            "FROM nutrition_auto_food_rules r "
+            "JOIN nutrition_auto_meals m ON m.id=r.meal_id AND m.profile_id=r.profile_id "
+            "JOIN food_database f ON f.id=r.food_id WHERE r.profile_id=? AND f.owner_telegram_id=? "
+            "ORDER BY m.position, m.id, f.name COLLATE NOCASE",
+            (profile_id, owner_id),
+        )).fetchall()
+
+    async def set_nutrition_auto_food_enabled(self, profile_id: int, meal_id: int, food_id: int, enabled: bool, owner_id: int) -> None:
+        food = await (await self._db().execute(
+            "SELECT name, unit FROM food_database WHERE id=? AND owner_telegram_id=?", (food_id, owner_id),
+        )).fetchone()
+        meal = await (await self._db().execute(
+            "SELECT 1 FROM nutrition_auto_meals WHERE id=? AND profile_id=?", (meal_id, profile_id),
+        )).fetchone()
+        if not food or not meal:
+            raise ValueError("Продукт або прийом їжі не знайдено.")
+        default_max, default_step = (4.0, 1.0) if food["unit"] == "шт" else (150.0, 5.0)
+        grain_markers = ("вівсян", "греч", "рис", "булгур", "макарон", "паста", "перлов", "пшоно", "ячн", "кускус", "кус-кус", "кіноа", "злак", "круп")
+        name = food["name"].casefold()
+        default_min = 0.0 if food["unit"] == "шт" or not any(marker in name for marker in grain_markers) else (40.0 if "вівсян" in name else 100.0 if "рис" in name else 80.0)
+        default_basis = "piece" if food["unit"] == "шт" else "database"
+        await self._db().execute(
+            "INSERT INTO nutrition_auto_food_rules(profile_id, meal_id, food_id, enabled, minimum, maximum, step, weight_basis) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(profile_id, meal_id, food_id) "
+            "DO UPDATE SET enabled=excluded.enabled",
+            (profile_id, meal_id, food_id, int(enabled), default_min, default_max, default_step, default_basis),
+        )
+        await self._db().commit()
+
+    async def update_nutrition_auto_food_rule(self, profile_id: int, meal_id: int, food_id: int, minimum: float, maximum: float, step: float, owner_id: int) -> None:
+        if minimum < 0 or maximum <= 0 or maximum < minimum or maximum > 2000 or step <= 0 or step > maximum:
+            raise ValueError("Перевірте мінімум, максимум і крок порції.")
+        food = await (await self._db().execute(
+            "SELECT unit FROM food_database WHERE id=? AND owner_telegram_id=?", (food_id, owner_id),
+        )).fetchone()
+        if not food:
+            raise ValueError("Продукт не знайдено.")
+        if food["unit"] == "шт" and (step != 1 or not float(minimum).is_integer() or not float(maximum).is_integer()):
+            raise ValueError("Для продукту в штуках використовуйте цілі числа й крок 1.")
+        cur = await self._db().execute(
+            "UPDATE nutrition_auto_food_rules SET minimum=?, maximum=?, step=? "
+            "WHERE profile_id=? AND meal_id=? AND food_id=? AND enabled=1",
+            (minimum, maximum, step, profile_id, meal_id, food_id),
+        )
+        if not cur.rowcount:
+            raise ValueError("Спочатку дозвольте продукт для цього прийому їжі.")
+        await self._db().commit()
+
+    async def set_nutrition_auto_weight_basis(self, profile_id: int, meal_id: int, food_id: int, basis: str, owner_id: int) -> bool:
+        if basis not in {"database", "dry", "raw", "cooked", "piece"}:
+            return False
+        food = await (await self._db().execute(
+            "SELECT unit FROM food_database WHERE id=? AND owner_telegram_id=?", (food_id, owner_id),
+        )).fetchone()
+        if not food or (food["unit"] == "шт" and basis != "piece") or (food["unit"] != "шт" and basis == "piece"):
+            return False
+        cur = await self._db().execute(
+            "UPDATE nutrition_auto_food_rules SET weight_basis=? WHERE profile_id=? AND meal_id=? AND food_id=? AND enabled=1",
+            (basis, profile_id, meal_id, food_id),
+        )
+        await self._db().commit()
+        return cur.rowcount > 0
+
+    async def save_nutrition_auto_week_plan(self, profile_id: int, start_date: str, end_date: str, days: list[dict[str, Any]]) -> int:
+        now = datetime.now().isoformat(timespec="seconds")
+        await self._db().execute(
+            "INSERT INTO nutrition_auto_week_plans(profile_id, start_date, end_date, days_json, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(profile_id, start_date) DO UPDATE SET "
+            "end_date=excluded.end_date, days_json=excluded.days_json, updated_at=excluded.updated_at",
+            (profile_id, start_date, end_date, json.dumps(days, ensure_ascii=False), now, now),
+        )
+        row = await (await self._db().execute(
+            "SELECT id FROM nutrition_auto_week_plans WHERE profile_id=? AND start_date=?", (profile_id, start_date),
+        )).fetchone()
+        await self._db().commit()
+        return int(row["id"])
+
+    async def nutrition_auto_week_plan_for_date(self, profile_id: int, value: str) -> aiosqlite.Row | None:
+        return await (await self._db().execute(
+            "SELECT * FROM nutrition_auto_week_plans WHERE profile_id=? AND start_date<=? AND end_date>=? "
+            "ORDER BY start_date DESC LIMIT 1",
+            (profile_id, value, value),
+        )).fetchone()
+
+    async def nutrition_auto_week_plan(self, profile_id: int, plan_id: int) -> aiosqlite.Row | None:
+        return await (await self._db().execute(
+            "SELECT * FROM nutrition_auto_week_plans WHERE profile_id=? AND id=?", (profile_id, plan_id),
+        )).fetchone()
+
+    async def update_nutrition_auto_week_plan_days(self, profile_id: int, plan_id: int, days: list[dict[str, Any]]) -> None:
+        await self._db().execute(
+            "UPDATE nutrition_auto_week_plans SET days_json=?, updated_at=? WHERE profile_id=? AND id=?",
+            (json.dumps(days, ensure_ascii=False), datetime.now().isoformat(timespec="seconds"), profile_id, plan_id),
+        )
+        await self._db().commit()
+
+    async def save_nutrition_plan_draft(self, profile_id: int, diet_type: str, plan_date: str, items: list[dict[str, Any]], totals: dict[str, float], targets: dict[str, float]) -> int:
+        cur = await self._db().execute(
+            "INSERT INTO nutrition_plan_drafts(profile_id, diet_type, plan_date, items_json, totals_json, targets_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (profile_id, diet_type, plan_date, json.dumps(items, ensure_ascii=False), json.dumps(totals), json.dumps(targets), datetime.now().isoformat(timespec="seconds")),
+        )
+        await self._db().commit()
+        return int(cur.lastrowid)
+
+    async def nutrition_plan_draft(self, profile_id: int, draft_id: int) -> aiosqlite.Row | None:
+        return await (await self._db().execute(
+            "SELECT * FROM nutrition_plan_drafts WHERE id=? AND profile_id=?", (draft_id, profile_id),
+        )).fetchone()
+
+    async def apply_nutrition_plan_draft(self, profile_id: int, draft_id: int, today: str) -> bool:
+        db = self._db()
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            draft = await (await db.execute(
+                "SELECT * FROM nutrition_plan_drafts WHERE id=? AND profile_id=?", (draft_id, profile_id),
+            )).fetchone()
+            if not draft or draft["applied_at"] or draft["plan_date"] != today:
+                await db.rollback()
+                return False
+            items = json.loads(draft["items_json"])
+            # Replace the previous generated menu for the date, preserving
+            # manually logged foods and any entries from before this feature.
+            await db.execute(
+                "DELETE FROM food_log WHERE profile_id=? AND log_date=? AND source_plan_id IS NOT NULL",
+                (profile_id, today),
+            )
+            for item in items:
+                await db.execute(
+                    "INSERT INTO food_log(profile_id, log_date, diet_type, meal, product_id, quantity, created_at, source_plan_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (profile_id, today, draft["diet_type"], item["meal"], int(item["product_id"]), float(item["quantity"]), datetime.now().isoformat(timespec="seconds"), draft_id),
+                )
+            cur = await db.execute(
+                "UPDATE nutrition_plan_drafts SET applied_at=? WHERE id=? AND profile_id=? AND applied_at IS NULL",
+                (datetime.now().isoformat(timespec="seconds"), draft_id, profile_id),
+            )
+            if cur.rowcount != 1:
+                await db.rollback()
+                return False
+            await db.commit()
+            return True
+        except Exception:
+            await db.rollback()
+            raise
 
     async def add_food_log(self, profile_id: int, log_date: str, meal: str, product_id: int, quantity: float, diet_type: str = "rest") -> None:
         db = self._db()
@@ -1772,6 +2138,15 @@ class Database:
         for table in ("food_log", "weight_log", "activity_log", "sleep_log", "meal_templates", "training_programs"):
             result[table] = []
             for profile_id in profile_ids:
+                rows = await (await self._db().execute(f"SELECT * FROM {table} WHERE profile_id=?", (profile_id,))).fetchall()
+                result[table].extend(dict(row) for row in rows)
+        result["nutrition_food_rules"] = []
+        result["nutrition_auto_meals"] = []
+        result["nutrition_auto_food_rules"] = []
+        result["nutrition_auto_week_plans"] = []
+        result["nutrition_plan_drafts"] = []
+        for profile_id in profile_ids:
+            for table in ("nutrition_food_rules", "nutrition_auto_meals", "nutrition_auto_food_rules", "nutrition_auto_week_plans", "nutrition_plan_drafts"):
                 rows = await (await self._db().execute(f"SELECT * FROM {table} WHERE profile_id=?", (profile_id,))).fetchall()
                 result[table].extend(dict(row) for row in rows)
         result["training_days"] = []
